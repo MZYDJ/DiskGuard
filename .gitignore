@@ -1,0 +1,13 @@
+# 运行输出
+Output/
+
+# 真实硬盘扫描报告（每份约 10 MB，且属于用户数据）
+BadTrack Report*.txt
+
+# 日志与临时文件
+*.log
+_*.ps1
+*.tmp
+Thumbs.db
+desktop.ini
+.vscode/
