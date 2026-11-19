@@ -641,6 +641,41 @@ Test-Case '34 SPC 未知时隔离区间不除零' {
     Assert-Equal 100 ([int64]$iso.Ranges[0].StartCylinder) 'SPC 未知时保护带应为 0'
 }
 
+
+# ---------------------------------------------------------------------------
+# 35 Linux：验证通过时生成分区与 LVM 脚本
+# ---------------------------------------------------------------------------
+Test-Case '35 Linux：生成分区与 LVM 脚本' {
+    $r = Join-Path $script:TempRoot 'r35.txt'
+    New-SyntheticReport -Path $r -Cylinders 1200 -DefaultMs 60 -Spread 8 -MsMap @{ 600 = 2000 }
+    $run = Invoke-TestRun -R1 $r -Tag 't35'
+    $sh = Join-Path $run.Dir 'Linux_Setup.sh'
+    Assert-True (Test-Path -LiteralPath $sh) '应生成 Linux_Setup.sh'
+    $text = Get-Content -LiteralPath $sh -Raw -Encoding UTF8
+    Assert-Match $text 'sgdisk -n 1:' '应包含 sgdisk 分区命令'
+    Assert-Match $text 'pvcreate' '应包含 pvcreate'
+    Assert-Match $text 'vgcreate "\$VG"' '应包含 vgcreate'
+    Assert-Match $text 'lvcreate -l 100%FREE' '应包含 lvcreate'
+    Assert-Match $text 'mkfs\.ext4' '应包含 mkfs.ext4'
+    Assert-Match $text 'SERIAL=' '应包含序列号读取'
+    Assert-Match $text 'vg_' '应包含 vg_ 前缀'
+    $bytes = [System.IO.File]::ReadAllBytes($sh)
+    Assert-True (($bytes[0] -ne 0xEF) -or ($bytes[1] -ne 0xBB) -or ($bytes[2] -ne 0xBF)) '脚本不应带 BOM'
+    Assert-Match $run.Plan 'Linux_Setup.sh' '计划中应提到脚本'
+}
+
+# ---------------------------------------------------------------------------
+# 36 Linux：LBA 未验证时不生成脚本
+# ---------------------------------------------------------------------------
+Test-Case '36 Linux：LBA 未验证时不生成脚本' {
+    $r = Join-Path $script:TempRoot 'r36.txt'
+    New-SyntheticReport -Path $r -Cylinders 1200 -DefaultMs 60 -RangeEnd 1300
+    $run = Invoke-TestRun -R1 $r -Tag 't36'
+    $sh = Join-Path $run.Dir 'Linux_Setup.sh'
+    Assert-True (-not (Test-Path -LiteralPath $sh)) '未验证时不应生成脚本'
+    Assert-Match $run.Plan '未生成 Linux_Setup.sh' '计划中应说明未生成'
+}
+
 # ---------------------------------------------------------------------------
 # 24 真实 ST3500418AS 双报告验收
 # ---------------------------------------------------------------------------

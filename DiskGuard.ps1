@@ -1412,6 +1412,109 @@ function Write-CsvFile {
     }
 }
 
+function Write-LinuxSetupScript {
+    param($Partitions, $Mapping, $Config, [string]$OutDir, [string]$Model)
+
+    if (-not $Mapping.Verified) { return $null }
+    $parts = @($Partitions | Where-Object { $_.Recommended } | Sort-Object StartLba)
+    if ($parts.Count -eq 0) { return $null }
+
+    $modelKey = [string]$Model
+    if ($modelKey -match '^HD\d+\s*:\s*') { $modelKey = $modelKey -replace '^HD\d+\s*:\s*', '' }
+    $paren = $modelKey.IndexOf('(')
+    if ($paren -gt 0) { $modelKey = $modelKey.Substring(0, $paren).Trim() }
+    $modelKey = ($modelKey -replace '[^\w\-\. ]', '_')
+
+    $L = New-Object 'System.Collections.Generic.List[string]'
+    $L.Add('#!/usr/bin/env bash')
+    $L.Add('# 由 DiskGuard 根据分区方案自动生成。')
+    $L.Add('# 用法：sudo bash Linux_Setup.sh /dev/sdX')
+    $L.Add('# 警告：会清空目标盘的分区表；执行前请确认设备名并备份数据。')
+    $L.Add('set -euo pipefail')
+    $L.Add('')
+    $L.Add('DISK="${1:-}"')
+    $L.Add('if [ -z "$DISK" ]; then')
+    $L.Add('  echo "用法: sudo bash Linux_Setup.sh /dev/sdX" >&2')
+    $L.Add('  exit 1')
+    $L.Add('fi')
+    $L.Add('if [ ! -b "$DISK" ]; then')
+    $L.Add('  echo "不是块设备: $DISK" >&2')
+    $L.Add('  exit 1')
+    $L.Add('fi')
+    $L.Add('for cmd in sgdisk partprobe udevadm pvcreate vgcreate lvcreate mkfs.ext4; do')
+    $L.Add('  command -v "$cmd" >/dev/null 2>&1 || { echo "缺少命令: $cmd" >&2; exit 1; }')
+    $L.Add('done')
+    $L.Add('')
+    $L.Add(('EXPECTED_SECTORS={0}' -f $Mapping.CapacitySectors))
+    $L.Add('ACTUAL_SECTORS=$(blockdev --getsz "$DISK")')
+    $L.Add('if [ "$ACTUAL_SECTORS" -ne "$EXPECTED_SECTORS" ]; then')
+    $L.Add('  echo "容量不匹配：期望 $EXPECTED_SECTORS 扇区，实际 $ACTUAL_SECTORS 扇区" >&2')
+    $L.Add('  exit 1')
+    $L.Add('fi')
+    $L.Add('if lsblk -no MOUNTPOINT "$DISK" 2>/dev/null | grep -q "[^[:space:]]"; then')
+    $L.Add('  echo "目标盘存在挂载点，拒绝操作。" >&2')
+    $L.Add('  exit 1')
+    $L.Add('fi')
+    $L.Add('if command -v findmnt >/dev/null 2>&1; then')
+    $L.Add('  ROOT_SRC=$(findmnt -n -o SOURCE / 2>/dev/null || true)')
+    $L.Add('  ROOT_DISK=$(lsblk -no PKNAME "$ROOT_SRC" 2>/dev/null | head -n1 || true)')
+    $L.Add('  if [ -n "$ROOT_DISK" ] && [ "/dev/$ROOT_DISK" = "$DISK" ]; then')
+    $L.Add('    echo "拒绝操作当前系统盘。" >&2')
+    $L.Add('    exit 1')
+    $L.Add('  fi')
+    $L.Add('fi')
+    $L.Add('')
+    $L.Add('echo "目标盘: $DISK"')
+    $L.Add(('echo "型号: {0}"' -f $modelKey))
+    $L.Add('echo "将创建以下分区（隔离带保持未分配）："')
+    for ($i = 0; $i -lt $parts.Count; $i++) {
+        $n = $i + 1
+        $L.Add(('echo "  {0}: LBA {1}-{2}（{3:N2} GiB）"' -f $n, $parts[$i].StartLba, $parts[$i].EndLba, $parts[$i].SizeGiB))
+    }
+    $L.Add('read -r -p "输入 YES 继续: " answer')
+    $L.Add('[ "$answer" = "YES" ] || { echo "已取消"; exit 1; }')
+    $L.Add('')
+    $L.Add('sgdisk --zap-all "$DISK"')
+    for ($i = 0; $i -lt $parts.Count; $i++) {
+        $n = $i + 1
+        $L.Add(('sgdisk -n {0}:{1}:{2} -t {0}:8e00 "$DISK"' -f $n, $parts[$i].StartLba, $parts[$i].EndLba))
+    }
+    $L.Add('partprobe "$DISK"')
+    $L.Add('udevadm settle')
+    $L.Add('sgdisk -p "$DISK"')
+    $L.Add('')
+    $L.Add('part() { case "$DISK" in *[0-9]) echo "${DISK}p$1" ;; *) echo "${DISK}$1" ;; esac; }')
+    $pvs = @()
+    for ($i = 0; $i -lt $parts.Count; $i++) { $pvs += ('"$(part {0})"' -f ($i + 1)) }
+    $L.Add(('wipefs -a {0}' -f ($pvs -join ' ')))
+    $L.Add(('pvcreate {0}' -f ($pvs -join ' ')))
+    $L.Add('')
+    $L.Add('SERIAL=$(lsblk -dno SERIAL "$DISK" 2>/dev/null | tr -d "[:space:]" || true)')
+    $L.Add('if [ -z "$SERIAL" ] || [ "$SERIAL" = "unknown" ]; then')
+    $L.Add('  SERIAL=$(lsblk -dno MODEL "$DISK" 2>/dev/null | tr -cd "[:alnum:]" | cut -c1-24 || true)')
+    $L.Add('fi')
+    $L.Add('if [ -z "$SERIAL" ]; then SERIAL=$(basename "$DISK"); fi')
+    $L.Add('VG="vg_$(printf "%s" "$SERIAL" | tr "[:upper:]" "[:lower:]" | sed "s/[^a-z0-9+_.-]/_/g" | cut -c1-100)"')
+    $L.Add('if vgs "$VG" >/dev/null 2>&1; then')
+    $L.Add('  echo "VG $VG 已存在，请先 vgrename 或修改脚本中的 VG 名。" >&2')
+    $L.Add('  exit 1')
+    $L.Add('fi')
+    $L.Add('echo "VG 名: $VG"')
+    $L.Add(('vgcreate "$VG" {0}' -f ($pvs -join ' ')))
+    $L.Add('lvcreate -l 100%FREE -n data "$VG"')
+    $L.Add('mkfs.ext4 -L data "/dev/$VG/data"')
+    $L.Add('mkdir -p /mnt/data')
+    $L.Add('mount "/dev/$VG/data" /mnt/data')
+    $L.Add('echo "完成。UUID: $(blkid -s UUID -o value "/dev/$VG/data")"')
+    $L.Add('echo "开机挂载：把 UUID 写入 /etc/fstab，例如："')
+    $L.Add('echo "  UUID=<上面的 UUID> /mnt/data ext4 defaults 0 2"')
+    $L.Add('echo "注意：隔离带保持未分配；LVM 只合并空间，不修复慢区/坏道。"')
+
+    $path = Join-Path $OutDir 'Linux_Setup.sh'
+    [System.IO.File]::WriteAllText($path, (($L.ToArray()) -join "`n") + "`n", (New-Object System.Text.UTF8Encoding($false)))
+    return $path
+}
+
 function Write-CylinderComparison {
     param([string]$Path, $R1, $R2)
     $enc = New-Object System.Text.UTF8Encoding($true)
@@ -1701,6 +1804,7 @@ function Invoke-DiskGuard {
     $safeModel = if ([string]::IsNullOrWhiteSpace($r1.Model)) { 'UnknownDisk' } else { ($r1.Model -replace '[^\w\-]', '_') }
     $out = Join-Path $OutputRoot ("{0}_{1}" -f $safeModel, $stamp)
     New-Item -ItemType Directory -Path $out -Force | Out-Null
+    $linuxScript = Write-LinuxSetupScript -Partitions $partitions -Mapping $mapping -Config $config -OutDir $out -Model $r1.Model
 
     $scanRows = New-Object 'System.Collections.Generic.List[object]'
     foreach ($r in @($r1, $r2)) {
@@ -1885,6 +1989,22 @@ function Invoke-DiskGuard {
     $plan.Add('  2. 本工具只读，不会修改磁盘或分区表；分区请用 DiskGenius/diskpart 人工执行。')
     $plan.Add('  3. 分区前请先备份重要数据。')
     $plan.Add(('  4. 完整耗时：{0:N1} 秒。' -f $script:RunClock.Elapsed.TotalSeconds))
+    $plan.Add('')
+    $plan.Add('七、Linux 分区与 LVM 命令')
+    if ($null -ne $linuxScript) {
+        $plan.Add('  已生成：Linux_Setup.sh（UTF-8 无 BOM，LF 换行）')
+        $plan.Add('  用法：sudo bash Linux_Setup.sh /dev/sdX')
+        $plan.Add('  VG 名：vg_<硬盘序列号>（脚本运行时从 lsblk SERIAL 读取并清洗）')
+        $plan.Add('  分区（仅可用区间，隔离带留空）：')
+        $rec = @($partitions | Where-Object { $_.Recommended } | Sort-Object StartLba)
+        for ($i = 0; $i -lt $rec.Count; $i++) {
+            $pp = $rec[$i]
+            $plan.Add(('    {0}: LBA {1}-{2}（{3:N2} GiB）' -f ($i + 1), $pp.StartLba, $pp.EndLba, $pp.SizeGiB))
+        }
+        $plan.Add('  说明：脚本会清空目标盘分区表；执行前请确认设备名并备份。')
+    } else {
+        $plan.Add('  LBA 映射未验证，未生成 Linux_Setup.sh；请先处理校验问题。')
+    }
     [System.IO.File]::WriteAllLines((Join-Path $out 'Partition_Plan.txt'), $plan.ToArray(), [System.Text.Encoding]::UTF8)
 
     if ($partitions.Count -gt 0) {
@@ -1947,6 +2067,12 @@ function Invoke-DiskGuard {
         [void]$h.Append(('<p class="muted">显示阈值：分区容量 ≥ 硬盘总容量的 {0}%。柱面/磁头/扇区为 255/63 传统几何；起始扇区号为绝对 LBA。</p>' -f $config.MinPartitionPercent))
     }
 
+    [void]$h.Append('<h2>Linux 分区与 LVM</h2>')
+    if ($null -ne $linuxScript) {
+        [void]$h.Append('<p class="muted">已生成 <a href="Linux_Setup.sh">Linux_Setup.sh</a>：<code>sudo bash Linux_Setup.sh /dev/sdX</code>。VG 名由脚本从硬盘序列号生成（<code>vg_&lt;serial&gt;</code>）。脚本会清空目标盘分区表，执行前请确认设备名并备份。</p>')
+    } else {
+        [void]$h.Append('<p class="muted">LBA 映射未验证，未生成 Linux_Setup.sh。</p>')
+    }
     [void]$h.Append('<h2>必须避开的隔离区间</h2><table><thead><tr><th>序号</th><th>柱面范围</th><th>风险</th><th>扫描1最大</th><th>扫描2最大</th><th>异常点</th><th>区域P95</th><th>每侧扩展</th><th>原因</th></tr></thead><tbody>')
     foreach ($rg in $iso.Ranges) {
         [void]$h.Append(('<tr><td>{0}</td><td>{1}-{2}</td><td>{3}</td><td>{4}</td><td>{5}</td><td>{6}</td><td>{7}</td><td>{8} MiB</td><td>{9}</td></tr>' -f $rg.RangeId, $rg.StartCylinder, $rg.EndCylinder, $rg.Risk, (Format-Num $rg.MaxMs1), (Format-Num $rg.MaxMs2), $rg.Points, (Format-Num $rg.RegionP95), $rg.GuardMiBEachSide, (& $enc $rg.Reason)))

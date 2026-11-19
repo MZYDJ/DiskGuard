@@ -15,7 +15,7 @@ DiskGuard 读取 DiskGenius 导出的 TXT 扫描报告，区分「明确读取�
 - **不过度隔离**：单个柱面即使两次都偏慢，只要未达临界幅度且不构成密集区域，只列入观察。
 - **LBA 安全**：10 项结构证据 + 物理盘独立证据；任一不通过只给柱面范围。
 - **可配置**：阈值、窗口、聚类、隔离带、风险策略、显示阈值都在 `Config.json`。
-- **自带测试**：34 项自动化测试，覆盖规范要求的 20 类场景 + 边界条件 + 真实报告验收。
+- **自带测试**：36 项自动化测试，覆盖规范要求的 20 类场景 + 边界条件 + 真实报告验收。
 
 ## 快速开始
 
@@ -51,6 +51,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\DiskGuard.ps1 `
 | `Anomaly_Clusters.csv` | 异常簇 / 连续慢区的区域指标与风险等级 |
 | `Anomaly_Details.csv` | 每个异常柱面的类别、延迟、局部阈值 |
 | `Scan_Comparison.csv` | 每次扫描的统计基线（中位数、MAD、P99、阈值等） |
+| `Linux_Setup.sh` | 映射验证通过时生成：Linux GPT 分区 + LVM 命令（VG 名从硬盘序列号生成） |
 | `Analysis.log` | 阶段耗时、校验结果、未解析行、警告 |
 
 `Cylinder_Comparison.csv`（5 MB 逐柱面对照）默认不生成，需要时把
@@ -67,6 +68,35 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\DiskGuard.ps1 `
 - 「占比」= 本分区容量 ÷ 硬盘总容量。
 - 分区之间会列出夹在中间的隔离区：异常柱面 ≤5 个时逐条写 `柱面=扫描1/扫描2`，
   超过 5 个只写 `共 N 个异常点，最大 扫描1/扫描2`。
+
+## Linux 分区与 LVM
+
+LBA 映射验证通过时，输出目录会多一个 `Linux_Setup.sh`（UTF-8 无 BOM、LF 换行）：
+
+```bash
+sudo bash Linux_Setup.sh /dev/sdX
+```
+
+脚本会：
+
+1. 校验目标盘是块设备、容量与报告总扇区数一致、没有挂载点、不是当前系统盘；
+2. 用 `sgdisk` 只在可用区间建 GPT 分区（类型 `8e00`），隔离带保持未分配；
+3. `wipefs` → `pvcreate` → `vgcreate` → `lvcreate` → `mkfs.ext4`；
+4. VG 名从 `lsblk -dno SERIAL` 读取硬盘序列号，清洗为 `vg_<serial>`；读不到时回退到型号或设备名。
+
+示例：
+
+```bash
+sgdisk -n 1:2781184:44161023 -t 1:8e00 "$DISK"
+...
+pvcreate "$(part 1)" ...
+vgcreate "$VG" "$(part 1)" ...
+lvcreate -l 100%FREE -n data "$VG"
+mkfs.ext4 -L data "/dev/$VG/data"
+```
+
+注意：脚本是**破坏性**的，会清空目标盘分区表；执行前请确认设备名并备份。
+LVM 只合并空间，不修复慢区/坏道；隔离带仍然空着。
 
 ## 配置
 
@@ -183,7 +213,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Tests\DiskGuard.Tests.
 - 区域慢区：稀疏异常点不合并、仅第二次扫描出现的慢区；
 - 双报告记录数不一致时禁止正式 LBA；
 - SPC 未知时不除零；
-- 真实 ST3500418AS 双报告验收（记录数、3 条错误、8 个参考慢点、总扇区数、耗时、隔离区数量）。
+- Linux 脚本：验证通过时生成、未验证时不生成、BOM/关键命令检查；\n- 真实 ST3500418AS 双报告验收（记录数、3 条错误、8 个参考慢点、总扇区数、耗时、隔离区数量）。
 
 全部通过时退出码为 0。加速内核不可用时，测试 22 会打印 SKIP，不判失败。
 
@@ -210,7 +240,7 @@ DiskGuard.ps1                     主程序（Windows PowerShell 5.1）
 DiskGuard_启动.cmd                双击启动入口
 Config.json                       可调整参数
 README.md                         本文件
-Tests\DiskGuard.Tests.ps1         自动化测试（34 项）
+Tests\DiskGuard.Tests.ps1         自动化测试（36 项）
 Tests\Benchmark.ps1               性能基准（可选）
 DiskGuard_算法设计与实现规范_v1.0.md   算法设计规范
 ```
