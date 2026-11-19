@@ -1494,7 +1494,8 @@ function Write-LinuxSetupScript {
     $L.Add('  SERIAL=$(lsblk -dno MODEL "$DISK" 2>/dev/null | tr -cd "[:alnum:]" | cut -c1-24 || true)')
     $L.Add('fi')
     $L.Add('if [ -z "$SERIAL" ]; then SERIAL=$(basename "$DISK"); fi')
-    $L.Add('VG="vg_$(printf "%s" "$SERIAL" | tr "[:upper:]" "[:lower:]" | sed "s/[^a-z0-9+_.-]/_/g" | cut -c1-100)"')
+    $L.Add('STAMP=$(date +%Y%m%d_%H%M)')
+    $L.Add('VG="vg_$(printf "%s" "$SERIAL" | tr "[:upper:]" "[:lower:]" | sed "s/[^a-z0-9+_.-]/_/g" | cut -c1-90)_${STAMP}"')
     $L.Add('if vgs "$VG" >/dev/null 2>&1; then')
     $L.Add('  echo "VG $VG 已存在，请先 vgrename 或修改脚本中的 VG 名。" >&2')
     $L.Add('  exit 1')
@@ -1990,20 +1991,54 @@ function Invoke-DiskGuard {
     $plan.Add('  3. 分区前请先备份重要数据。')
     $plan.Add(('  4. 完整耗时：{0:N1} 秒。' -f $script:RunClock.Elapsed.TotalSeconds))
     $plan.Add('')
-    $plan.Add('七、Linux 分区与 LVM 命令')
+    $plan.Add('七、Linux 分区与 LVM 命令（可逐条复制执行）')
+    $linuxCmdLines = New-Object 'System.Collections.Generic.List[string]'
     if ($null -ne $linuxScript) {
-        $plan.Add('  已生成：Linux_Setup.sh（UTF-8 无 BOM，LF 换行）')
-        $plan.Add('  用法：sudo bash Linux_Setup.sh /dev/sdX')
-        $plan.Add('  VG 名：vg_<硬盘序列号>（脚本运行时从 lsblk SERIAL 读取并清洗）')
-        $plan.Add('  分区（仅可用区间，隔离带留空）：')
         $rec = @($partitions | Where-Object { $_.Recommended } | Sort-Object StartLba)
+        $modelKey = [string]$r1.Model
+        if ($modelKey -match '^HD\d+\s*:\s*') { $modelKey = $modelKey -replace '^HD\d+\s*:\s*', '' }
+        $paren = $modelKey.IndexOf('(')
+        if ($paren -gt 0) { $modelKey = $modelKey.Substring(0, $paren).Trim() }
+        $modelKey = ($modelKey -replace '[^\w\-\.]', '_')
+        if ([string]::IsNullOrWhiteSpace($modelKey)) { $modelKey = 'DISK' }
+
+        $linuxCmdLines.Add('设备：/dev/sdX（按实际替换；NVMe 为 /dev/nvme0n1，分区名加 p，如 /dev/nvme0n1p1）')
+        $linuxCmdLines.Add('VG 名（序列号 + 当前时间）：')
+        $linuxCmdLines.Add('  SERIAL=$(lsblk -dno SERIAL /dev/sdX | tr -d ''[:space:]'')')
+        $linuxCmdLines.Add(('  VG="vg_${{SERIAL:-{0}}}_$(date +%Y%m%d_%H%M)"' -f $modelKey))
+        $linuxCmdLines.Add('')
+        $linuxCmdLines.Add('分区（隔离带留空，逐条执行）：')
         for ($i = 0; $i -lt $rec.Count; $i++) {
             $pp = $rec[$i]
-            $plan.Add(('    {0}: LBA {1}-{2}（{3:N2} GiB）' -f ($i + 1), $pp.StartLba, $pp.EndLba, $pp.SizeGiB))
+            $linuxCmdLines.Add(('  sgdisk -n {0}:{1}:{2} -t {0}:8e00 /dev/sdX' -f ($i + 1), $pp.StartLba, $pp.EndLba))
         }
-        $plan.Add('  说明：脚本会清空目标盘分区表；执行前请确认设备名并备份。')
+        $linuxCmdLines.Add('')
+        $linuxCmdLines.Add('刷新分区表：')
+        $linuxCmdLines.Add('  partprobe /dev/sdX')
+        $linuxCmdLines.Add('  udevadm settle')
+        $linuxCmdLines.Add('')
+        $linuxCmdLines.Add('清除旧签名 + 创建 PV（逐条执行）：')
+        for ($i = 0; $i -lt $rec.Count; $i++) {
+            $n = $i + 1
+            $linuxCmdLines.Add(('  wipefs -a /dev/sdX{0}' -f $n))
+            $linuxCmdLines.Add(('  pvcreate /dev/sdX{0}' -f $n))
+        }
+        $linuxCmdLines.Add('')
+        $linuxCmdLines.Add('创建 VG / LV / 文件系统：')
+        $pvList = (0..($rec.Count - 1) | ForEach-Object { '/dev/sdX' + ($_ + 1) }) -join ' '
+        $linuxCmdLines.Add(('  vgcreate "$VG" {0}' -f $pvList))
+        $linuxCmdLines.Add('  lvcreate -l 100%FREE -n data "$VG"')
+        $linuxCmdLines.Add('  mkfs.ext4 -L data "/dev/$VG/data"')
+        $linuxCmdLines.Add('  mkdir -p /mnt/data')
+        $linuxCmdLines.Add('  mount "/dev/$VG/data" /mnt/data')
+        $linuxCmdLines.Add('')
+        $linuxCmdLines.Add('说明：以上命令会清空目标盘分区表；执行前请确认设备名并备份。')
+        $linuxCmdLines.Add('      隔离带不要建分区；LVM 只合并空间，不修复慢区/坏道。')
+        foreach ($line in $linuxCmdLines) { $plan.Add($(if ([string]::IsNullOrEmpty($line)) { '' } else { '  ' + $line })) }
+        $plan.Add('  另：已生成 Linux_Setup.sh，可一次性执行（sudo bash Linux_Setup.sh /dev/sdX）。')
     } else {
-        $plan.Add('  LBA 映射未验证，未生成 Linux_Setup.sh；请先处理校验问题。')
+        $linuxCmdLines.Add('LBA 映射未验证，未生成 Linux 命令和 Linux_Setup.sh；请先处理校验问题。')
+        foreach ($line in $linuxCmdLines) { $plan.Add(('  ' + $line)) }
     }
     [System.IO.File]::WriteAllLines((Join-Path $out 'Partition_Plan.txt'), $plan.ToArray(), [System.Text.Encoding]::UTF8)
 
@@ -2017,7 +2052,7 @@ function Invoke-DiskGuard {
     $h = New-Object System.Text.StringBuilder
     $enc = { param($t) [System.Net.WebUtility]::HtmlEncode([string]$t) }
     [void]$h.Append('<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DiskGuard 分区方案</title>')
-    [void]$h.Append('<style>body{font-family:Segoe UI,Microsoft YaHei,sans-serif;margin:24px;color:#20242a}h1{font-size:20px;margin:0 0 4px}h2{font-size:15px;margin:22px 0 8px}table{border-collapse:collapse}th,td{border:1px solid #c8ccd2;padding:5px 9px;font-size:13px;text-align:left}th{background:#f0f2f5}.muted{color:#666;font-size:13px}.frag{color:#888}.iso td{background:#fff8e6;color:#7a4b00;font-size:12px;padding-left:24px}code{background:#f4f5f7;padding:1px 4px}</style></head><body>')
+    [void]$h.Append('<style>body{font-family:Segoe UI,Microsoft YaHei,sans-serif;margin:24px;color:#20242a}h1{font-size:20px;margin:0 0 4px}h2{font-size:15px;margin:22px 0 8px}table{border-collapse:collapse}th,td{border:1px solid #c8ccd2;padding:5px 9px;font-size:13px;text-align:left}th{background:#f0f2f5}.muted{color:#666;font-size:13px}.frag{color:#888}.iso td{background:#fff8e6;color:#7a4b00;font-size:12px;padding-left:24px}code{background:#f4f5f7;padding:1px 4px}pre.cmd{background:#f7f8fa;border:1px solid #dde1e6;padding:10px;font-size:12px;line-height:1.5;overflow:auto}</style></head><body>')
     [void]$h.Append('<h1>DiskGuard 分区方案</h1>')
     [void]$h.Append(('<p class="muted">生成时间 {0} · {1} · 只读分析，不会修改磁盘</p>' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $(if ($r2) { '双报告' } else { '单报告' })))
     [void]$h.Append('<h2>磁盘</h2><table>')
@@ -2069,10 +2104,11 @@ function Invoke-DiskGuard {
 
     [void]$h.Append('<h2>Linux 分区与 LVM</h2>')
     if ($null -ne $linuxScript) {
-        [void]$h.Append('<p class="muted">已生成 <a href="Linux_Setup.sh">Linux_Setup.sh</a>：<code>sudo bash Linux_Setup.sh /dev/sdX</code>。VG 名由脚本从硬盘序列号生成（<code>vg_&lt;serial&gt;</code>）。脚本会清空目标盘分区表，执行前请确认设备名并备份。</p>')
+        [void]$h.Append('<p class="muted">以下命令可逐条复制执行；也可直接运行 <a href="Linux_Setup.sh">Linux_Setup.sh</a>。VG 名为“序列号 + 当前时间”，序列号读不到时回退到型号。命令会清空目标盘分区表，执行前请确认设备名并备份。</p>')
     } else {
-        [void]$h.Append('<p class="muted">LBA 映射未验证，未生成 Linux_Setup.sh。</p>')
+        [void]$h.Append('<p class="muted">LBA 映射未验证，未生成 Linux 命令和 Linux_Setup.sh。</p>')
     }
+    [void]$h.Append('<pre class="cmd">' + (& $enc (($linuxCmdLines -join "`n"))) + '</pre>')
     [void]$h.Append('<h2>必须避开的隔离区间</h2><table><thead><tr><th>序号</th><th>柱面范围</th><th>风险</th><th>扫描1最大</th><th>扫描2最大</th><th>异常点</th><th>区域P95</th><th>每侧扩展</th><th>原因</th></tr></thead><tbody>')
     foreach ($rg in $iso.Ranges) {
         [void]$h.Append(('<tr><td>{0}</td><td>{1}-{2}</td><td>{3}</td><td>{4}</td><td>{5}</td><td>{6}</td><td>{7}</td><td>{8} MiB</td><td>{9}</td></tr>' -f $rg.RangeId, $rg.StartCylinder, $rg.EndCylinder, $rg.Risk, (Format-Num $rg.MaxMs1), (Format-Num $rg.MaxMs2), $rg.Points, (Format-Num $rg.RegionP95), $rg.GuardMiBEachSide, (& $enc $rg.Reason)))

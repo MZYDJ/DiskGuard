@@ -71,26 +71,32 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\DiskGuard.ps1 `
 
 ## Linux 分区与 LVM
 
-LBA 映射验证通过时，输出目录会多一个 `Linux_Setup.sh`（UTF-8 无 BOM、LF 换行）：
+LBA 映射验证通过时，`Partition_Plan.txt` 的第七节会直接列出**可逐条复制执行**的命令；
+同时输出目录会多一个 `Linux_Setup.sh`（UTF-8 无 BOM、LF 换行），可一次性执行：
 
 ```bash
 sudo bash Linux_Setup.sh /dev/sdX
 ```
 
-脚本会：
+报告里的命令按分区逐条列出，方便只执行其中一部分。脚本会：
 
 1. 校验目标盘是块设备、容量与报告总扇区数一致、没有挂载点、不是当前系统盘；
 2. 用 `sgdisk` 只在可用区间建 GPT 分区（类型 `8e00`），隔离带保持未分配；
 3. `wipefs` → `pvcreate` → `vgcreate` → `lvcreate` → `mkfs.ext4`；
-4. VG 名从 `lsblk -dno SERIAL` 读取硬盘序列号，清洗为 `vg_<serial>`；读不到时回退到型号或设备名。
+4. VG 名为 `vg_<序列号>_<yyyymmdd_hhmm>`：序列号从 `lsblk -dno SERIAL` 读取并清洗，
+   读不到时回退到型号；时间取执行时刻。
 
 示例：
 
 ```bash
-sgdisk -n 1:2781184:44161023 -t 1:8e00 "$DISK"
+SERIAL=$(lsblk -dno SERIAL /dev/sdX | tr -d '[:space:]')
+VG="vg_${SERIAL:-ST3500418AS}_$(date +%Y%m%d_%H%M)"
+
+sgdisk -n 1:2781184:44161023 -t 1:8e00 /dev/sdX
 ...
-pvcreate "$(part 1)" ...
-vgcreate "$VG" "$(part 1)" ...
+pvcreate /dev/sdX1
+...
+vgcreate "$VG" /dev/sdX1 ... /dev/sdX15
 lvcreate -l 100%FREE -n data "$VG"
 mkfs.ext4 -L data "/dev/$VG/data"
 ```

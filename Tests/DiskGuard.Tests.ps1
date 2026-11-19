@@ -662,6 +662,9 @@ Test-Case '35 Linux：生成分区与 LVM 脚本' {
     $bytes = [System.IO.File]::ReadAllBytes($sh)
     Assert-True (($bytes[0] -ne 0xEF) -or ($bytes[1] -ne 0xBB) -or ($bytes[2] -ne 0xBF)) '脚本不应带 BOM'
     Assert-Match $run.Plan 'Linux_Setup.sh' '计划中应提到脚本'
+    Assert-Match $run.Plan 'sgdisk -n 1:' '计划中应包含分区命令'
+    Assert-Match $run.Plan 'pvcreate /dev/sdX1' '计划中应包含 pvcreate'
+    Assert-Match $run.Plan 'VG=' '计划中应包含 VG 命名命令'
 }
 
 # ---------------------------------------------------------------------------
@@ -673,7 +676,7 @@ Test-Case '36 Linux：LBA 未验证时不生成脚本' {
     $run = Invoke-TestRun -R1 $r -Tag 't36'
     $sh = Join-Path $run.Dir 'Linux_Setup.sh'
     Assert-True (-not (Test-Path -LiteralPath $sh)) '未验证时不应生成脚本'
-    Assert-Match $run.Plan '未生成 Linux_Setup.sh' '计划中应说明未生成'
+    Assert-Match $run.Plan '未生成 Linux 命令' '计划中应说明未生成'
 }
 
 # ---------------------------------------------------------------------------
