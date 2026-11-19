@@ -171,7 +171,6 @@ DiskGuard_启动.cmd                双击启动入口
 Config.json                       可调整参数
 README.md                         本文件
 Tests\DiskGuard.Tests.ps1         自动化测试（24 项）
-Legacy\DiskGuard_v1.0.4.ps1       旧版脚本备份，仅作对照
 DiskGuard_算法设计与实现规范_v1.0.md   算法设计规范
 ```
 
@@ -197,3 +196,7 @@ DiskGuard_算法设计与实现规范_v1.0.md   算法设计规范
 4. 逐行管道与重复属性访问。
 
 v2.0.0 重写了整条流水线，详见 `DiskGuard_算法设计与实现规范_v1.0.md`。
+
+## 许可证
+
+[MIT](LICENSE)
