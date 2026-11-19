@@ -1424,6 +1424,7 @@ function Write-LinuxSetupScript {
     $paren = $modelKey.IndexOf('(')
     if ($paren -gt 0) { $modelKey = $modelKey.Substring(0, $paren).Trim() }
     $modelKey = ($modelKey -replace '[^\w\-\. ]', '_')
+    if ($modelKey.Length -gt 90) { $modelKey = $modelKey.Substring(0, 90) }
 
     $L = New-Object 'System.Collections.Generic.List[string]'
     $L.Add('#!/usr/bin/env bash')
@@ -1996,6 +1997,7 @@ function Invoke-DiskGuard {
         if ($paren -gt 0) { $modelKey = $modelKey.Substring(0, $paren).Trim() }
         $modelKey = ($modelKey -replace '[^\w\-\.]', '_')
         if ([string]::IsNullOrWhiteSpace($modelKey)) { $modelKey = 'DISK' }
+        if ($modelKey.Length -gt 90) { $modelKey = $modelKey.Substring(0, 90) }
 
         $linuxCmdLines.Add('设备：/dev/sdX（按实际替换；NVMe 为 /dev/nvme0n1，分区名加 p，如 /dev/nvme0n1p1）')
         $linuxCmdLines.Add('VG 名（型号 + 当前时间）：')
