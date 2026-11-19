@@ -662,6 +662,10 @@ Test-Case '35 Linux：生成分区与 LVM 脚本' {
     Assert-Match $text 'STAMP=' '应包含时间戳'
     Assert-Match $text 'SERIAL=' '应显示序列号用于身份核对'
     Assert-Match $text 'vg_synthetic' 'VG 名应使用型号'
+    Assert-Match $text '/vol00/SYNTHETIC_LVM' '应使用飞牛风格挂载点'
+    Assert-Match $text 'mountpoint -q' '应检查挂载点占用'
+    Assert-Match $text 'mount -o noatime,errors=remount-ro' '应使用 noatime/remount-ro'
+    Assert-Match $run.LvmPlan '挂载点：/vol00/SYNTHETIC_LVM' 'LVM 报告应包含挂载点'
     $bytes = [System.IO.File]::ReadAllBytes($sh)
     Assert-True (($bytes[0] -ne 0xEF) -or ($bytes[1] -ne 0xBB) -or ($bytes[2] -ne 0xBF)) '脚本不应带 BOM'
     Assert-Match $run.Plan 'Linux_Setup.sh' '手工报告应指向脚本'
@@ -698,7 +702,7 @@ Test-Case '37 分区阈值：小于 5% 不显示' {
     Assert-Equal 1 $small.Count '应有 1 个被隐藏的区间'
     Assert-Equal 'true' $small[0].Recommended '被隐藏的区间仍应 ≥2 GiB'
     $sh = Get-Content -LiteralPath (Join-Path $run.Dir 'Linux_Setup.sh') -Raw -Encoding UTF8
-    Assert-Equal 3 ([regex]::Matches($sh, 'sgdisk -n ').Count) 'LVM 脚本应使用所有 ≥2 GiB 的分区'
+    Assert-Equal 3 ([regex]::Matches($sh, ' -n \d+:').Count) 'LVM 脚本应使用所有 ≥2 GiB 的分区'
 }
 
 # ---------------------------------------------------------------------------
@@ -714,7 +718,7 @@ Test-Case '38 分区阈值：小于 2 GiB 不创建' {
     $frag = @($run.Parts | Where-Object { $_.Recommended -eq 'false' })
     Assert-Equal 2 $frag.Count '两个小于 2 GiB 的区间应标为碎片'
     $sh = Get-Content -LiteralPath (Join-Path $run.Dir 'Linux_Setup.sh') -Raw -Encoding UTF8
-    Assert-Equal 1 ([regex]::Matches($sh, 'sgdisk -n ').Count) '脚本应只创建显示的分区'
+    Assert-Equal 1 ([regex]::Matches($sh, ' -n \d+:').Count) '脚本应只创建显示的分区'
 }
 
 

@@ -80,7 +80,8 @@ LBA 映射验证通过后，输出目录会生成两份方案：
 | `Partition_Plan_LVM.txt` | LVM 管理 | 仅 `MinPartitionGiB`（默认 2 GiB），使用全部可用区间 |
 
 `Partition_Plan_LVM.txt` 包含全部 PV 的起止 LBA/CHS、隔离区间清单、可逐条复制的 Linux 命令，
-以及 `Linux_Setup.sh` 的说明。
+以及 `Linux_Setup.sh` 的说明。挂载点默认 `/vol00/<型号>_LVM`，例如 `/vol00/ST3500418AS_LVM`，
+与飞牛的外接盘目录风格一致。
 
 ### 破坏性内容的确认门槛
 
@@ -101,12 +102,16 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\DiskGuard.ps1 `
 
 `Linux_Setup.sh` 在第一次写盘之前完成：
 
-1. 依赖命令检查；
+1. 依赖命令检查（含 `mountpoint`）；
 2. `blockdev --getsize64` 容量（字节）和 `--getss` 逻辑扇区大小；
 3. `lsblk` 型号比对，并显示型号/序列号/WWN；
 4. 沿 `findmnt` + `lsblk -s` + `/proc/swaps` 检查目标盘是否被系统使用；
 5. VG 名冲突检查（`vgs`）；
-6. 输入完整设备路径 + `YES` 二次确认。
+6. 挂载点 `/vol00/<型号>_LVM` 占用检查；
+7. 输入完整设备路径 + `YES` 二次确认；
+8. 分区表用一条 `sgdisk` 批量写入，`partprobe` 后用 `lsblk` 复核；
+9. `wipefs -n` 先预览旧签名，再 `wipefs -a`；
+10. 挂载时使用 `noatime,errors=remount-ro`。
 
 VG 名为 `vg_<型号>_<yyyymmdd_hhmmss>`，型号清洗为 ASCII，读不到时用 `disk`。
 
@@ -114,13 +119,16 @@ VG 名为 `vg_<型号>_<yyyymmdd_hhmmss>`，型号清洗为 ASCII，读不到时
 
 ```bash
 VG="vg_st3500418as_$(date +%Y%m%d_%H%M%S)"
-sgdisk -n 1:2781184:44161023 -t 1:8e00 /dev/sdX
+sgdisk --zap-all /dev/sdX
+sgdisk -n 1:... -t 1:8e00 -n 2:... -t 2:8e00 ... "$DISK"
 ...
 pvcreate /dev/sdX1
 ...
 vgcreate "$VG" /dev/sdX1 ... /dev/sdX11
 lvcreate -l 100%FREE -n data "$VG"
 mkfs.ext4 -L data "/dev/$VG/data"
+mkdir -p /vol00/ST3500418AS_LVM
+mount -o noatime,errors=remount-ro "/dev/$VG/data" /vol00/ST3500418AS_LVM
 ```
 
 注意：脚本是**破坏性**的，会清空目标盘分区表；执行前请确认设备名并备份。

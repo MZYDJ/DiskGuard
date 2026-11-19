@@ -15,13 +15,14 @@ if [ ! -b "$DISK" ]; then
 fi
 
 # 所有依赖必须在第一次写盘之前检查
-for cmd in sgdisk partprobe udevadm blockdev lsblk grep findmnt head sort wipefs pvcreate pvs vgs vgcreate lvcreate mkfs.ext4 blkid mkdir mount date tr sed cut; do
+for cmd in sgdisk partprobe udevadm blockdev lsblk grep findmnt head sort mountpoint wipefs pvcreate pvs vgs vgcreate lvcreate mkfs.ext4 blkid mkdir mount date tr sed cut; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "缺少命令: $cmd" >&2; exit 1; }
 done
 
 EXPECTED_BYTES=9870336000
 EXPECTED_LOGSS=512
 EXPECTED_MODEL=''
+MOUNT_POINT="/vol00/DISK_LVM"
 ACTUAL_BYTES=$(blockdev --getsize64 "$DISK")
 ACTUAL_LOGSS=$(blockdev --getss "$DISK")
 if [ "$ACTUAL_BYTES" -ne "$EXPECTED_BYTES" ]; then
@@ -81,6 +82,10 @@ if vgs "$VG" >/dev/null 2>&1; then
   echo "VG $VG 已存在，请先 vgrename 或修改脚本中的 VG 名。" >&2
   exit 1
 fi
+if mountpoint -q "$MOUNT_POINT"; then
+  echo "挂载点 $MOUNT_POINT 已被占用，拒绝操作。" >&2
+  exit 1
+fi
 
 echo "将创建以下分区（隔离带保持未分配）："
 echo "  1: LBA 2048-8577023（4.09 GiB）"
@@ -95,21 +100,29 @@ read -r -p "输入 YES 继续（将清空分区表）: " answer
 [ "$answer" = "YES" ] || { echo "已取消"; exit 1; }
 
 sgdisk --zap-all "$DISK"
-sgdisk -n 1:2048:8577023 -t 1:8e00 "$DISK"
-sgdisk -n 2:10717184:19277823 -t 2:8e00 "$DISK"
+sgdisk -n 1:2048:8577023 -t 1:8e00 -n 2:10717184:19277823 -t 2:8e00 "$DISK"
 partprobe "$DISK"
 udevadm settle
 sgdisk -p "$DISK"
+lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT "$DISK"
 
 part() { case "$DISK" in *[0-9]) echo "${DISK}p$1" ;; *) echo "${DISK}$1" ;; esac; }
+wipefs -n "$(part 1)" "$(part 2)" || true
+echo "以上为检测到的旧签名；继续执行 wipefs -a。"
 wipefs -a "$(part 1)" "$(part 2)"
 pvcreate "$(part 1)" "$(part 2)"
 vgcreate "$VG" "$(part 1)" "$(part 2)"
 lvcreate -l 100%FREE -n data "$VG"
 mkfs.ext4 -L data "/dev/$VG/data"
-mkdir -p /mnt/data
-mount "/dev/$VG/data" /mnt/data
-echo "完成。UUID: $(blkid -s UUID -o value "/dev/$VG/data")"
-echo "开机挂载：把 UUID 写入 /etc/fstab，例如："
-echo "  UUID=<上面的 UUID> /mnt/data ext4 defaults 0 2"
+mkdir -p "$MOUNT_POINT"
+if mountpoint -q "$MOUNT_POINT"; then
+  echo "挂载点 $MOUNT_POINT 已被占用，拒绝操作。" >&2
+  exit 1
+fi
+mount -o noatime,errors=remount-ro "/dev/$VG/data" "$MOUNT_POINT"
+UUID=$(blkid -s UUID -o value "/dev/$VG/data")
+echo "完成。UUID: $UUID"
+echo "挂载点: $MOUNT_POINT"
+echo "开机挂载：把下面一行加入 /etc/fstab："
+echo "  UUID=$UUID $MOUNT_POINT ext4 defaults,noatime,errors=remount-ro,nofail 0 2"
 echo "注意：隔离带保持未分配；LVM 只合并空间，不修复慢区/坏道。"

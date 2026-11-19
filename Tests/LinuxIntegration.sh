@@ -8,7 +8,7 @@ SIZE=9870336000
 IMG=$(mktemp /tmp/diskguard.XXXXXX.img)
 LOOP=""
 VG=""
-MOUNT=/mnt/data
+MOUNT=/vol00/DISK_LVM
 
 cleanup() {
     set +e

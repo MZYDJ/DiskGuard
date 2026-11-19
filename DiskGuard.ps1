@@ -1437,6 +1437,8 @@ function Write-LinuxSetupScript {
     $expectedModel = if ($hasModel) { $modelKey } else { '' }
     $logical = [int64]$Config.LogicalSectorBytes
     $expectedBytes = [int64]$Mapping.CapacitySectors * $logical
+    $mountName = (Get-SafeModelKey $Model).ToUpperInvariant() + '_LVM'
+    $mountPoint = '/vol00/' + $mountName
 
     $L = New-Object 'System.Collections.Generic.List[string]'
     $L.Add('#!/usr/bin/env bash')
@@ -1456,13 +1458,14 @@ function Write-LinuxSetupScript {
     $L.Add('fi')
     $L.Add('')
     $L.Add('# 所有依赖必须在第一次写盘之前检查')
-    $L.Add('for cmd in sgdisk partprobe udevadm blockdev lsblk grep findmnt head sort wipefs pvcreate pvs vgs vgcreate lvcreate mkfs.ext4 blkid mkdir mount date tr sed cut; do')
+    $L.Add('for cmd in sgdisk partprobe udevadm blockdev lsblk grep findmnt head sort mountpoint wipefs pvcreate pvs vgs vgcreate lvcreate mkfs.ext4 blkid mkdir mount date tr sed cut; do')
     $L.Add('  command -v "$cmd" >/dev/null 2>&1 || { echo "缺少命令: $cmd" >&2; exit 1; }')
     $L.Add('done')
     $L.Add('')
     $L.Add(('EXPECTED_BYTES={0}' -f $expectedBytes))
     $L.Add(('EXPECTED_LOGSS={0}' -f $logical))
     $L.Add(("EXPECTED_MODEL='{0}'" -f $expectedModel))
+    $L.Add(('MOUNT_POINT="{0}"' -f $mountPoint))
     $L.Add('ACTUAL_BYTES=$(blockdev --getsize64 "$DISK")')
     $L.Add('ACTUAL_LOGSS=$(blockdev --getss "$DISK")')
     $L.Add('if [ "$ACTUAL_BYTES" -ne "$EXPECTED_BYTES" ]; then')
@@ -1522,6 +1525,10 @@ function Write-LinuxSetupScript {
     $L.Add('  echo "VG $VG 已存在，请先 vgrename 或修改脚本中的 VG 名。" >&2')
     $L.Add('  exit 1')
     $L.Add('fi')
+    $L.Add('if mountpoint -q "$MOUNT_POINT"; then')
+    $L.Add('  echo "挂载点 $MOUNT_POINT 已被占用，拒绝操作。" >&2')
+    $L.Add('  exit 1')
+    $L.Add('fi')
     $L.Add('')
     $L.Add('echo "将创建以下分区（隔离带保持未分配）："')
     for ($i = 0; $i -lt $parts.Count; $i++) {
@@ -1538,27 +1545,38 @@ function Write-LinuxSetupScript {
     $L.Add('[ "$answer" = "YES" ] || { echo "已取消"; exit 1; }')
     $L.Add('')
     $L.Add('sgdisk --zap-all "$DISK"')
+    $sg = 'sgdisk'
     for ($i = 0; $i -lt $parts.Count; $i++) {
         $n = $i + 1
-        $L.Add(('sgdisk -n {0}:{1}:{2} -t {0}:8e00 "$DISK"' -f $n, $parts[$i].StartLba, $parts[$i].EndLba))
+        $sg += (' -n {0}:{1}:{2} -t {0}:8e00' -f $n, $parts[$i].StartLba, $parts[$i].EndLba)
     }
+    $L.Add($sg + ' "$DISK"')
     $L.Add('partprobe "$DISK"')
     $L.Add('udevadm settle')
     $L.Add('sgdisk -p "$DISK"')
+    $L.Add('lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT "$DISK"')
     $L.Add('')
     $L.Add('part() { case "$DISK" in *[0-9]) echo "${DISK}p$1" ;; *) echo "${DISK}$1" ;; esac; }')
     $pvs = @()
     for ($i = 0; $i -lt $parts.Count; $i++) { $pvs += ('"$(part {0})"' -f ($i + 1)) }
+    $L.Add(('wipefs -n {0} || true' -f ($pvs -join ' ')))
+    $L.Add('echo "以上为检测到的旧签名；继续执行 wipefs -a。"')
     $L.Add(('wipefs -a {0}' -f ($pvs -join ' ')))
     $L.Add(('pvcreate {0}' -f ($pvs -join ' ')))
     $L.Add(('vgcreate "$VG" {0}' -f ($pvs -join ' ')))
     $L.Add('lvcreate -l 100%FREE -n data "$VG"')
     $L.Add('mkfs.ext4 -L data "/dev/$VG/data"')
-    $L.Add('mkdir -p /mnt/data')
-    $L.Add('mount "/dev/$VG/data" /mnt/data')
-    $L.Add('echo "完成。UUID: $(blkid -s UUID -o value "/dev/$VG/data")"')
-    $L.Add('echo "开机挂载：把 UUID 写入 /etc/fstab，例如："')
-    $L.Add('echo "  UUID=<上面的 UUID> /mnt/data ext4 defaults 0 2"')
+    $L.Add('mkdir -p "$MOUNT_POINT"')
+    $L.Add('if mountpoint -q "$MOUNT_POINT"; then')
+    $L.Add('  echo "挂载点 $MOUNT_POINT 已被占用，拒绝操作。" >&2')
+    $L.Add('  exit 1')
+    $L.Add('fi')
+    $L.Add('mount -o noatime,errors=remount-ro "/dev/$VG/data" "$MOUNT_POINT"')
+    $L.Add('UUID=$(blkid -s UUID -o value "/dev/$VG/data")')
+    $L.Add('echo "完成。UUID: $UUID"')
+    $L.Add('echo "挂载点: $MOUNT_POINT"')
+    $L.Add('echo "开机挂载：把下面一行加入 /etc/fstab："')
+    $L.Add('echo "  UUID=$UUID $MOUNT_POINT ext4 defaults,noatime,errors=remount-ro,nofail 0 2"')
     $L.Add('echo "注意：隔离带保持未分配；LVM 只合并空间，不修复慢区/坏道。"')
 
     $path = Join-Path $OutDir 'Linux_Setup.sh'
@@ -1579,17 +1597,21 @@ function Get-LinuxCommandLines {
     $modelKey = Get-SafeModelKey $Model
     $logical = [int64]$Config.LogicalSectorBytes
     $expectedBytes = [int64]$Mapping.CapacitySectors * $logical
+    $mountName = (Get-SafeModelKey $Model).ToUpperInvariant() + '_LVM'
+    $mountPoint = '/vol00/' + $mountName
 
     $lines.Add('警告：以下命令会清空目标盘分区表；不包含 Linux_Setup.sh 中的自动检查，')
     $lines.Add('      优先执行脚本；逐条执行前必须自行确认设备、容量和系统盘占用。')
     $lines.Add('')
     $lines.Add('设备：/dev/sdX（按实际替换；NVMe 为 /dev/nvme0n1，分区名加 p）')
+    $lines.Add(('挂载点：{0}' -f $mountPoint))
     $lines.Add('执行前检查（必须全部通过）：')
     $lines.Add('  lsblk -dno MODEL,SERIAL,WWN,SIZE,LOG-SEC /dev/sdX')
     $lines.Add(('  blockdev --getsize64 /dev/sdX    # 应等于 {0}' -f $expectedBytes))
     $lines.Add(('  blockdev --getss /dev/sdX        # 应等于 {0}' -f $logical))
     $lines.Add('  findmnt -rn -o SOURCE,TARGET     # 确认目标盘未被挂载')
     $lines.Add('  cat /proc/swaps                  # 确认目标盘未用作 swap')
+    $lines.Add(('  mountpoint -q {0}                # 应无输出（未挂载）' -f $mountPoint))
     $lines.Add('')
     $lines.Add('VG 名（型号 + 当前时间）：')
     $lines.Add(('  VG="vg_{0}_$(date +%Y%m%d_%H%M%S)"' -f $modelKey))
@@ -1602,10 +1624,12 @@ function Get-LinuxCommandLines {
     $lines.Add('刷新分区表：')
     $lines.Add('  partprobe /dev/sdX')
     $lines.Add('  udevadm settle')
+    $lines.Add('  lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT /dev/sdX')
     $lines.Add('')
-    $lines.Add('清除旧签名 + 创建 PV（逐条执行）：')
+    $lines.Add('清除旧签名 + 创建 PV（逐条执行，先 wipefs -n 预览）：')
     for ($i = 0; $i -lt $parts.Count; $i++) {
         $n = $i + 1
+        $lines.Add(('  wipefs -n /dev/sdX{0}' -f $n))
         $lines.Add(('  wipefs -a /dev/sdX{0}' -f $n))
         $lines.Add(('  pvcreate /dev/sdX{0}' -f $n))
     }
@@ -1615,8 +1639,11 @@ function Get-LinuxCommandLines {
     $lines.Add(('  vgcreate "$VG" {0}' -f $pvList))
     $lines.Add('  lvcreate -l 100%FREE -n data "$VG"')
     $lines.Add('  mkfs.ext4 -L data "/dev/$VG/data"')
-    $lines.Add('  mkdir -p /mnt/data')
-    $lines.Add('  mount "/dev/$VG/data" /mnt/data')
+    $lines.Add(('  mkdir -p {0}' -f $mountPoint))
+    $lines.Add(('  mountpoint -q {0} && {{ echo "挂载点已占用"; exit 1; }}' -f $mountPoint))
+    $lines.Add(('  mount -o noatime,errors=remount-ro "/dev/$VG/data" {0}' -f $mountPoint))
+    $lines.Add('  UUID=$(blkid -s UUID -o value "/dev/$VG/data")')
+    $lines.Add(('  echo "  UUID=$UUID {0} ext4 defaults,noatime,errors=remount-ro,nofail 0 2"' -f $mountPoint))
     return ,$lines
 }
 
@@ -2112,6 +2139,7 @@ function Invoke-DiskGuard {
     }
 [System.IO.File]::WriteAllLines((Join-Path $out 'Partition_Plan.txt'), $plan.ToArray(), [System.Text.Encoding]::UTF8)
     # ---- LVM 方案（仅按绝对值过滤） ----
+    $lvmMountPoint = '/vol00/' + (Get-SafeModelKey $r1.Model).ToUpperInvariant() + '_LVM'
     $lvmPlan = New-Object 'System.Collections.Generic.List[string]'
     $lvmPlan.Add('DiskGuard LVM 方案')
     $lvmPlan.Add('================')
@@ -2120,6 +2148,7 @@ function Invoke-DiskGuard {
     $lvmPlan.Add(('总容量：{0:N2} GiB（{1} 扇区，逻辑扇区 {2} 字节）' -f (($mapping.CapacitySectors * [double]$config.LogicalSectorBytes) / 1073741824.0), $mapping.CapacitySectors, $config.LogicalSectorBytes))
     $lvmPlan.Add(('LBA 映射：{0}（{1}）' -f $(if ($mapping.Verified) { '已验证' } else { '未验证' }), $mapping.VerificationLevel))
     $lvmPlan.Add(('LBA 人工确认：{0}' -f $(if ([bool]$config.LbaMappingConfirmed) { '是' } else { '否' })))
+    $lvmPlan.Add(('挂载点：{0}' -f $lvmMountPoint))
     $lvmPlan.Add(('过滤条件：仅 ≥ {0} GiB（MinPartitionGiB），不使用百分比过滤' -f $config.MinPartitionGiB))
     $lvmPlan.Add(('破坏性命令：{0}' -f $(if ($lvmAllowed) { '已生成' } else { '未生成（需要 LBA 确认或独立证据）' })))
     $lvmPlan.Add('')
@@ -2212,7 +2241,7 @@ function Invoke-DiskGuard {
     if ($lvmParts.Count -eq 0) {
         [void]$h.Append(('<p class="muted">没有 ≥ {0} GiB 的可用区间。</p>' -f $config.MinPartitionGiB))
     } else {
-        [void]$h.Append(('<p class="muted">共 {0} 个 PV，合计 {1:N2} GiB；不使用百分比过滤。</p>' -f $lvmParts.Count, $lvmSum))
+        [void]$h.Append(('<p class="muted">共 {0} 个 PV，合计 {1:N2} GiB；不使用百分比过滤；挂载点 <code>{2}</code>。</p>' -f $lvmParts.Count, $lvmSum, (& $enc $lvmMountPoint)))
         [void]$h.Append('<table><thead><tr><th>序号</th><th>容量</th><th>占比</th><th>起始柱面</th><th>磁头</th><th>扇区</th><th>起始扇区号</th><th>总扇区数</th><th>结束柱面</th><th>结束磁头</th><th>结束扇区</th></tr></thead><tbody>')
         for ($li = 0; $li -lt $lvmParts.Count; $li++) {
             $lp = $lvmParts[$li]
