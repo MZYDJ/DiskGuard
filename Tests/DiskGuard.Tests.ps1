@@ -610,6 +610,7 @@ Test-Case '32 双报告记录数不一致：禁止正式 LBA' {
     $run = Invoke-TestRun -R1 $r1 -R2 $r2 -Tag 't32'
     Assert-Match $run.Plan 'LBA 映射：未验证' '记录数不一致时不得输出 LBA'
     Assert-Match $run.Plan '记录数不同' '应说明记录数不一致'
+    Assert-Match $run.Plan '已跳过局部异常检测' '柱面不连续时应跳过按索引的局部检测'
 }
 
 # ---------------------------------------------------------------------------
