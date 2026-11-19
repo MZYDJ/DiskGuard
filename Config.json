@@ -34,5 +34,6 @@
   "SectorsPerCylinderOverride": null,
   "LbaMappingConfirmed": false,
   "RequireManualLbaConfirmation": false,
-  "RequireIndependentLbaEvidence": false
+  "RequireIndependentLbaEvidence": false,
+  "RequireConfirmedLbaForScript": true
 }

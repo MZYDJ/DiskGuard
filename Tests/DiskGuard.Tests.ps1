@@ -130,16 +130,18 @@ function Get-RunOutput([string]$Dir) {
         Parts    = $parts
         Cyl      = $cyl
         Plan     = (Get-Content -LiteralPath (Join-Path $Dir 'Partition_Plan.txt') -Raw -Encoding UTF8)
+        LvmPlan  = (Get-Content -LiteralPath (Join-Path $Dir 'Partition_Plan_LVM.txt') -Raw -Encoding UTF8)
         Log      = (Get-Content -LiteralPath (Join-Path $Dir 'Analysis.log') -Raw -Encoding UTF8)
     }
 }
 
 function Invoke-TestRun {
-    param([string]$R1, [string]$R2, [string]$Tag, [string]$ConfigPath, [switch]$NoAccelerator)
+    param([string]$R1, [string]$R2, [string]$Tag, [string]$ConfigPath, [switch]$NoAccelerator, [switch]$ConfirmLba)
     $outRoot = Join-Path $script:TempRoot $Tag
     New-Item -ItemType Directory -Path $outRoot -Force | Out-Null
     $splat = @{ Report1 = $R1; OutputRoot = $outRoot; NoBrowser = $true; NoPause = $true }
     if ($NoAccelerator) { $splat.NoAccelerator = $true }
+    if ($ConfirmLba) { $splat.ConfirmLba = $true }
     if ($ConfigPath) { $splat.ConfigPath = $ConfigPath }
     if ($R2) { $splat.Report2 = $R2 } else { $splat.SingleScan = $true }
     $dir = Invoke-DiskGuard @splat 6>$null
@@ -648,7 +650,7 @@ Test-Case '34 SPC 未知时隔离区间不除零' {
 Test-Case '35 Linux：生成分区与 LVM 脚本' {
     $r = Join-Path $script:TempRoot 'r35.txt'
     New-SyntheticReport -Path $r -Cylinders 1200 -DefaultMs 60 -Spread 8 -MsMap @{ 600 = 2000 }
-    $run = Invoke-TestRun -R1 $r -Tag 't35'
+    $run = Invoke-TestRun -R1 $r -Tag 't35' -ConfirmLba
     $sh = Join-Path $run.Dir 'Linux_Setup.sh'
     Assert-True (Test-Path -LiteralPath $sh) '应生成 Linux_Setup.sh'
     $text = Get-Content -LiteralPath $sh -Raw -Encoding UTF8
@@ -658,15 +660,15 @@ Test-Case '35 Linux：生成分区与 LVM 脚本' {
     Assert-Match $text 'lvcreate -l 100%FREE' '应包含 lvcreate'
     Assert-Match $text 'mkfs\.ext4' '应包含 mkfs.ext4'
     Assert-Match $text 'STAMP=' '应包含时间戳'
-    Assert-NotMatch $text 'SERIAL=' '不应再读取序列号'
+    Assert-Match $text 'SERIAL=' '应显示序列号用于身份核对'
     Assert-Match $text 'vg_synthetic' 'VG 名应使用型号'
     $bytes = [System.IO.File]::ReadAllBytes($sh)
     Assert-True (($bytes[0] -ne 0xEF) -or ($bytes[1] -ne 0xBB) -or ($bytes[2] -ne 0xBF)) '脚本不应带 BOM'
-    Assert-Match $run.Plan 'Linux_Setup.sh' '计划中应提到脚本'
-    Assert-Match $run.Plan 'sgdisk -n 1:' '计划中应包含分区命令'
-    Assert-Match $run.Plan 'pvcreate /dev/sdX1' '计划中应包含 pvcreate'
-    Assert-Match $run.Plan 'VG=' '计划中应包含 VG 命名命令'
-    Assert-Match $run.Plan 'vg_synthetic' '计划中的 VG 名应使用型号'
+    Assert-Match $run.Plan 'Linux_Setup.sh' '手工报告应指向脚本'
+    Assert-Match $run.LvmPlan 'sgdisk -n 1:' 'LVM 报告应包含分区命令'
+    Assert-Match $run.LvmPlan 'pvcreate /dev/sdX1' 'LVM 报告应包含 pvcreate'
+    Assert-Match $run.LvmPlan 'VG=' 'LVM 报告应包含 VG 命名命令'
+    Assert-Match $run.LvmPlan 'vg_synthetic' 'LVM 报告的 VG 名应使用型号'
 }
 
 # ---------------------------------------------------------------------------
@@ -678,7 +680,7 @@ Test-Case '36 Linux：LBA 未验证时不生成脚本' {
     $run = Invoke-TestRun -R1 $r -Tag 't36'
     $sh = Join-Path $run.Dir 'Linux_Setup.sh'
     Assert-True (-not (Test-Path -LiteralPath $sh)) '未验证时不应生成脚本'
-    Assert-Match $run.Plan '未生成 Linux 命令' '计划中应说明未生成'
+    Assert-Match $run.LvmPlan '未生成' 'LVM 报告应说明未生成'
 }
 
 
@@ -688,7 +690,7 @@ Test-Case '36 Linux：LBA 未验证时不生成脚本' {
 Test-Case '37 分区阈值：小于 5% 不显示' {
     $r = Join-Path $script:TempRoot 'r37.txt'
     New-SyntheticReport -Path $r -Cylinders 20000 -DefaultMs 60 -ErrorCylinders @(1000, 3000)
-    $run = Invoke-TestRun -R1 $r -Tag 't37'
+    $run = Invoke-TestRun -R1 $r -Tag 't37' -ConfirmLba
     Assert-Equal 3 $run.Parts.Count '应有 3 个可用区间'
     $shown = @($run.Parts | Where-Object { $_.Displayed -eq 'true' })
     Assert-Equal 2 $shown.Count '小于 5% 的区间不应显示'
@@ -696,7 +698,7 @@ Test-Case '37 分区阈值：小于 5% 不显示' {
     Assert-Equal 1 $small.Count '应有 1 个被隐藏的区间'
     Assert-Equal 'true' $small[0].Recommended '被隐藏的区间仍应 ≥2 GiB'
     $sh = Get-Content -LiteralPath (Join-Path $run.Dir 'Linux_Setup.sh') -Raw -Encoding UTF8
-    Assert-Equal 2 ([regex]::Matches($sh, 'sgdisk -n ').Count) '脚本应只创建显示的分区'
+    Assert-Equal 3 ([regex]::Matches($sh, 'sgdisk -n ').Count) 'LVM 脚本应使用所有 ≥2 GiB 的分区'
 }
 
 # ---------------------------------------------------------------------------
@@ -705,7 +707,7 @@ Test-Case '37 分区阈值：小于 5% 不显示' {
 Test-Case '38 分区阈值：小于 2 GiB 不创建' {
     $r = Join-Path $script:TempRoot 'r38.txt'
     New-SyntheticReport -Path $r -Cylinders 1200 -DefaultMs 60 -ErrorCylinders @(200, 1000)
-    $run = Invoke-TestRun -R1 $r -Tag 't38'
+    $run = Invoke-TestRun -R1 $r -Tag 't38' -ConfirmLba
     Assert-Equal 3 $run.Parts.Count '应有 3 个可用区间'
     $shown = @($run.Parts | Where-Object { $_.Displayed -eq 'true' })
     Assert-Equal 1 $shown.Count '只应显示 ≥2 GiB 的区间'
@@ -713,6 +715,53 @@ Test-Case '38 分区阈值：小于 2 GiB 不创建' {
     Assert-Equal 2 $frag.Count '两个小于 2 GiB 的区间应标为碎片'
     $sh = Get-Content -LiteralPath (Join-Path $run.Dir 'Linux_Setup.sh') -Raw -Encoding UTF8
     Assert-Equal 1 ([regex]::Matches($sh, 'sgdisk -n ').Count) '脚本应只创建显示的分区'
+}
+
+
+# ---------------------------------------------------------------------------
+# 39 未确认 LBA 时不生成破坏性内容
+# ---------------------------------------------------------------------------
+Test-Case '39 未确认 LBA 时不生成破坏性内容' {
+    $r = Join-Path $script:TempRoot 'r39.txt'
+    New-SyntheticReport -Path $r -Cylinders 1200 -DefaultMs 60 -MsMap @{ 600 = 2000 }
+    $run = Invoke-TestRun -R1 $r -Tag 't39'
+    $sh = Join-Path $run.Dir 'Linux_Setup.sh'
+    Assert-True (-not (Test-Path -LiteralPath $sh)) '未确认时不应生成脚本'
+    Assert-Match $run.LvmPlan '未生成' 'LVM 报告应说明未生成'
+    Assert-Match $run.Plan '分区方案' '手工报告仍应生成'
+}
+
+# ---------------------------------------------------------------------------
+# 40 手工方案与 LVM 方案使用不同阈值
+# ---------------------------------------------------------------------------
+Test-Case '40 手工方案与 LVM 方案数量不同' {
+    $r = Join-Path $script:TempRoot 'r40.txt'
+    New-SyntheticReport -Path $r -Cylinders 20000 -DefaultMs 60 -ErrorCylinders @(1000, 3000)
+    $run = Invoke-TestRun -R1 $r -Tag 't40' -ConfirmLba
+    $manual = @($run.Parts | Where-Object { $_.Displayed -eq 'true' })
+    $lvm = @($run.Parts | Where-Object { $_.Lvm -eq 'true' })
+    Assert-Equal 2 $manual.Count '手工方案应只显示 ≥5% 的区间'
+    Assert-Equal 3 $lvm.Count 'LVM 方案应包含所有 ≥2 GiB 的区间'
+    Assert-Match $run.LvmPlan 'LVM PV 列表（3 个' 'LVM 报告应列出 3 个 PV'
+}
+
+
+# ---------------------------------------------------------------------------
+# 41 Linux 脚本 bash -n
+# ---------------------------------------------------------------------------
+Test-Case '41 Linux 脚本 bash -n' {
+    $r = Join-Path $script:TempRoot 'r41.txt'
+    New-SyntheticReport -Path $r -Cylinders 1200 -DefaultMs 60 -MsMap @{ 600 = 2000 }
+    $run = Invoke-TestRun -R1 $r -Tag 't41' -ConfirmLba
+    $sh = Join-Path $run.Dir 'Linux_Setup.sh'
+    Assert-True (Test-Path -LiteralPath $sh) '应生成脚本'
+    $bash = @('C:\Program Files\Git\bin\bash.exe', 'C:\Program Files\Git\usr\bin\bash.exe', '/bin/bash', '/usr/bin/bash') | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if (-not $bash) {
+        Write-Host '      SKIP：未找到 bash' -ForegroundColor Yellow
+        return
+    }
+    & $bash -n $sh
+    Assert-Equal 0 $LASTEXITCODE 'bash -n 应通过'
 }
 
 # ---------------------------------------------------------------------------

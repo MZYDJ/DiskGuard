@@ -16,7 +16,8 @@ param(
     [switch]$NoBrowser,
     [switch]$NoPause,
     [switch]$SingleScan,
-    [switch]$NoAccelerator
+    [switch]$NoAccelerator,
+    [switch]$ConfirmLba
 )
 
 Set-StrictMode -Version 2
@@ -110,6 +111,7 @@ function Get-DiskGuardConfig([string]$Path) {
         LbaMappingConfirmed           = $false
         RequireManualLbaConfirmation  = $false
         RequireIndependentLbaEvidence = $false
+        RequireConfirmedLbaForScript  = $true
     }
     if (Test-Path -LiteralPath $Path -PathType Leaf) {
         try {
@@ -1412,23 +1414,33 @@ function Write-CsvFile {
     }
 }
 
-function Write-LinuxSetupScript {
-    param($Partitions, $Mapping, $Config, [string]$OutDir, [string]$Model)
+function Get-SafeModelKey([string]$Model) {
+    $m = [string]$Model
+    if ($m -match '^HD\d+\s*:\s*') { $m = $m -replace '^HD\d+\s*:\s*', '' }
+    $p = $m.IndexOf('(')
+    if ($p -gt 0) { $m = $m.Substring(0, $p) }
+    $m = $m.Trim().ToLowerInvariant()
+    $m = $m -replace '[^a-z0-9+_.-]', '_'
+    if ([string]::IsNullOrWhiteSpace($m)) { $m = 'disk' }
+    if ($m.Length -gt 80) { $m = $m.Substring(0, 80) }
+    return $m
+}
 
-    if (-not $Mapping.Verified) { return $null }
-    $parts = @($Partitions | Where-Object { $_.Displayed } | Sort-Object StartLba)
+function Write-LinuxSetupScript {
+    param($Parts, $Mapping, $Config, [string]$OutDir, [string]$Model)
+
+    $parts = @($Parts | Sort-Object StartLba)
     if ($parts.Count -eq 0) { return $null }
 
-    $modelKey = [string]$Model
-    if ($modelKey -match '^HD\d+\s*:\s*') { $modelKey = $modelKey -replace '^HD\d+\s*:\s*', '' }
-    $paren = $modelKey.IndexOf('(')
-    if ($paren -gt 0) { $modelKey = $modelKey.Substring(0, $paren).Trim() }
-    $modelKey = ($modelKey -replace '[^\w\-\. ]', '_')
-    if ($modelKey.Length -gt 90) { $modelKey = $modelKey.Substring(0, 90) }
+    $modelKey = Get-SafeModelKey $Model
+    $hasModel = -not [string]::IsNullOrWhiteSpace($Model)
+    $expectedModel = if ($hasModel) { $modelKey } else { '' }
+    $logical = [int64]$Config.LogicalSectorBytes
+    $expectedBytes = [int64]$Mapping.CapacitySectors * $logical
 
     $L = New-Object 'System.Collections.Generic.List[string]'
     $L.Add('#!/usr/bin/env bash')
-    $L.Add('# 由 DiskGuard 根据分区方案自动生成。')
+    $L.Add('# 由 DiskGuard 根据 LVM 方案自动生成。')
     $L.Add('# 用法：sudo bash Linux_Setup.sh /dev/sdX')
     $L.Add('# 警告：会清空目标盘的分区表；执行前请确认设备名并备份数据。')
     $L.Add('set -euo pipefail')
@@ -1442,37 +1454,87 @@ function Write-LinuxSetupScript {
     $L.Add('  echo "不是块设备: $DISK" >&2')
     $L.Add('  exit 1')
     $L.Add('fi')
-    $L.Add('for cmd in sgdisk partprobe udevadm pvcreate vgcreate lvcreate mkfs.ext4; do')
+    $L.Add('')
+    $L.Add('# 所有依赖必须在第一次写盘之前检查')
+    $L.Add('for cmd in sgdisk partprobe udevadm blockdev lsblk grep findmnt head sort wipefs pvcreate pvs vgs vgcreate lvcreate mkfs.ext4 blkid mkdir mount date tr sed cut; do')
     $L.Add('  command -v "$cmd" >/dev/null 2>&1 || { echo "缺少命令: $cmd" >&2; exit 1; }')
     $L.Add('done')
     $L.Add('')
-    $L.Add(('EXPECTED_SECTORS={0}' -f $Mapping.CapacitySectors))
-    $L.Add('ACTUAL_SECTORS=$(blockdev --getsz "$DISK")')
-    $L.Add('if [ "$ACTUAL_SECTORS" -ne "$EXPECTED_SECTORS" ]; then')
-    $L.Add('  echo "容量不匹配：期望 $EXPECTED_SECTORS 扇区，实际 $ACTUAL_SECTORS 扇区" >&2')
+    $L.Add(('EXPECTED_BYTES={0}' -f $expectedBytes))
+    $L.Add(('EXPECTED_LOGSS={0}' -f $logical))
+    $L.Add(("EXPECTED_MODEL='{0}'" -f $expectedModel))
+    $L.Add('ACTUAL_BYTES=$(blockdev --getsize64 "$DISK")')
+    $L.Add('ACTUAL_LOGSS=$(blockdev --getss "$DISK")')
+    $L.Add('if [ "$ACTUAL_BYTES" -ne "$EXPECTED_BYTES" ]; then')
+    $L.Add('  echo "容量不匹配：期望 $EXPECTED_BYTES 字节，实际 $ACTUAL_BYTES 字节" >&2')
+    $L.Add('  exit 1')
+    $L.Add('fi')
+    $L.Add('if [ "$ACTUAL_LOGSS" -ne "$EXPECTED_LOGSS" ]; then')
+    $L.Add('  echo "逻辑扇区大小不匹配：期望 $EXPECTED_LOGSS，实际 $ACTUAL_LOGSS" >&2')
+    $L.Add('  exit 1')
+    $L.Add('fi')
+    $L.Add('')
+    $L.Add('MODEL=$(lsblk -dno MODEL "$DISK" 2>/dev/null | sed "s/[[:space:]]*$//" || true)')
+    $L.Add('SERIAL=$(lsblk -dno SERIAL "$DISK" 2>/dev/null | tr -d "[:space:]" || true)')
+    $L.Add('WWN=$(lsblk -dno WWN "$DISK" 2>/dev/null | tr -d "[:space:]" || true)')
+    $L.Add('echo "目标盘: $DISK"')
+    $L.Add('echo "型号: $MODEL"')
+    $L.Add('echo "序列号: ${SERIAL:-未知}"')
+    $L.Add('echo "WWN: ${WWN:-未知}"')
+    $L.Add('echo "容量: $ACTUAL_BYTES 字节"')
+    $L.Add('echo "逻辑扇区: $ACTUAL_LOGSS 字节"')
+    $L.Add('if [ -n "$EXPECTED_MODEL" ]; then')
+    $L.Add('  if ! printf "%s" "$MODEL" | tr "[:upper:]" "[:lower:]" | grep -qF "$EXPECTED_MODEL"; then')
+    $L.Add('    echo "型号不匹配：期望包含 $EXPECTED_MODEL，实际 $MODEL" >&2')
+    $L.Add('    exit 1')
+    $L.Add('  fi')
+    $L.Add('fi')
+    $L.Add('')
+    $L.Add('disk_in_use() {')
+    $L.Add('  local disk="$1" src dev d')
+    $L.Add('  while IFS= read -r src; do')
+    $L.Add('    [ -z "$src" ] && continue')
+    $L.Add('    for d in $(lsblk -sno NAME "$src" 2>/dev/null || true); do')
+    $L.Add('      [ "/dev/$d" = "$disk" ] && return 0')
+    $L.Add('    done')
+    $L.Add('  done < <(findmnt -rn -o SOURCE 2>/dev/null | sort -u)')
+    $L.Add('  while read -r dev _; do')
+    $L.Add('    [ "$dev" = "Filename" ] && continue')
+    $L.Add('    [ -z "$dev" ] && continue')
+    $L.Add('    for d in $(lsblk -sno NAME "$dev" 2>/dev/null || true); do')
+    $L.Add('      [ "/dev/$d" = "$disk" ] && return 0')
+    $L.Add('    done')
+    $L.Add('  done < /proc/swaps')
+    $L.Add('  return 1')
+    $L.Add('}')
+    $L.Add('if disk_in_use "$DISK"; then')
+    $L.Add('  echo "目标盘正在被当前系统使用（挂载或 swap），拒绝操作。" >&2')
     $L.Add('  exit 1')
     $L.Add('fi')
     $L.Add('if lsblk -no MOUNTPOINT "$DISK" 2>/dev/null | grep -q "[^[:space:]]"; then')
     $L.Add('  echo "目标盘存在挂载点，拒绝操作。" >&2')
     $L.Add('  exit 1')
     $L.Add('fi')
-    $L.Add('if command -v findmnt >/dev/null 2>&1; then')
-    $L.Add('  ROOT_SRC=$(findmnt -n -o SOURCE / 2>/dev/null || true)')
-    $L.Add('  ROOT_DISK=$(lsblk -no PKNAME "$ROOT_SRC" 2>/dev/null | head -n1 || true)')
-    $L.Add('  if [ -n "$ROOT_DISK" ] && [ "/dev/$ROOT_DISK" = "$DISK" ]; then')
-    $L.Add('    echo "拒绝操作当前系统盘。" >&2')
-    $L.Add('    exit 1')
-    $L.Add('  fi')
+    $L.Add('')
+    $L.Add('STAMP=$(date +%Y%m%d_%H%M%S)')
+    $L.Add(('VG="vg_{0}_${{STAMP}}"' -f $modelKey))
+    $L.Add('if vgs "$VG" >/dev/null 2>&1; then')
+    $L.Add('  echo "VG $VG 已存在，请先 vgrename 或修改脚本中的 VG 名。" >&2')
+    $L.Add('  exit 1')
     $L.Add('fi')
     $L.Add('')
-    $L.Add('echo "目标盘: $DISK"')
-    $L.Add(('echo "型号: {0}"' -f $modelKey))
     $L.Add('echo "将创建以下分区（隔离带保持未分配）："')
     for ($i = 0; $i -lt $parts.Count; $i++) {
         $n = $i + 1
         $L.Add(('echo "  {0}: LBA {1}-{2}（{3:N2} GiB）"' -f $n, $parts[$i].StartLba, $parts[$i].EndLba, $parts[$i].SizeGiB))
     }
-    $L.Add('read -r -p "输入 YES 继续: " answer')
+    $L.Add('echo "VG 名: $VG"')
+    $L.Add('read -r -p "输入设备路径确认（$DISK）: " confirm')
+    $L.Add('if [ "$confirm" != "$DISK" ]; then')
+    $L.Add('  echo "设备路径不匹配，已取消。" >&2')
+    $L.Add('  exit 1')
+    $L.Add('fi')
+    $L.Add('read -r -p "输入 YES 继续（将清空分区表）: " answer')
     $L.Add('[ "$answer" = "YES" ] || { echo "已取消"; exit 1; }')
     $L.Add('')
     $L.Add('sgdisk --zap-all "$DISK"')
@@ -1489,14 +1551,6 @@ function Write-LinuxSetupScript {
     for ($i = 0; $i -lt $parts.Count; $i++) { $pvs += ('"$(part {0})"' -f ($i + 1)) }
     $L.Add(('wipefs -a {0}' -f ($pvs -join ' ')))
     $L.Add(('pvcreate {0}' -f ($pvs -join ' ')))
-    $L.Add('')
-    $L.Add('STAMP=$(date +%Y%m%d_%H%M)')
-    $L.Add(('VG="vg_{0}_${{STAMP}}"' -f $modelKey.ToLowerInvariant()))
-    $L.Add('if vgs "$VG" >/dev/null 2>&1; then')
-    $L.Add('  echo "VG $VG 已存在，请先 vgrename 或修改脚本中的 VG 名。" >&2')
-    $L.Add('  exit 1')
-    $L.Add('fi')
-    $L.Add('echo "VG 名: $VG"')
     $L.Add(('vgcreate "$VG" {0}' -f ($pvs -join ' ')))
     $L.Add('lvcreate -l 100%FREE -n data "$VG"')
     $L.Add('mkfs.ext4 -L data "/dev/$VG/data"')
@@ -1510,6 +1564,60 @@ function Write-LinuxSetupScript {
     $path = Join-Path $OutDir 'Linux_Setup.sh'
     [System.IO.File]::WriteAllText($path, (($L.ToArray()) -join "`n") + "`n", (New-Object System.Text.UTF8Encoding($false)))
     return $path
+}
+
+function Get-LinuxCommandLines {
+    param($Parts, $Mapping, $Config, [string]$Model, [bool]$Allowed)
+
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    if (-not $Allowed) {
+        $lines.Add('LBA 映射未达到破坏性操作要求，未生成 Linux 命令。')
+        $lines.Add('在 Config.json 设 LbaMappingConfirmed=true，或运行时加 -ConfirmLba，或让物理盘独立证据一致后重跑。')
+        return ,$lines
+    }
+    $parts = @($Parts | Sort-Object StartLba)
+    $modelKey = Get-SafeModelKey $Model
+    $logical = [int64]$Config.LogicalSectorBytes
+    $expectedBytes = [int64]$Mapping.CapacitySectors * $logical
+
+    $lines.Add('警告：以下命令会清空目标盘分区表；不包含 Linux_Setup.sh 中的自动检查，')
+    $lines.Add('      优先执行脚本；逐条执行前必须自行确认设备、容量和系统盘占用。')
+    $lines.Add('')
+    $lines.Add('设备：/dev/sdX（按实际替换；NVMe 为 /dev/nvme0n1，分区名加 p）')
+    $lines.Add('执行前检查（必须全部通过）：')
+    $lines.Add('  lsblk -dno MODEL,SERIAL,WWN,SIZE,LOG-SEC /dev/sdX')
+    $lines.Add(('  blockdev --getsize64 /dev/sdX    # 应等于 {0}' -f $expectedBytes))
+    $lines.Add(('  blockdev --getss /dev/sdX        # 应等于 {0}' -f $logical))
+    $lines.Add('  findmnt -rn -o SOURCE,TARGET     # 确认目标盘未被挂载')
+    $lines.Add('  cat /proc/swaps                  # 确认目标盘未用作 swap')
+    $lines.Add('')
+    $lines.Add('VG 名（型号 + 当前时间）：')
+    $lines.Add(('  VG="vg_{0}_$(date +%Y%m%d_%H%M%S)"' -f $modelKey))
+    $lines.Add('')
+    $lines.Add('分区（隔离带留空，逐条执行）：')
+    for ($i = 0; $i -lt $parts.Count; $i++) {
+        $lines.Add(('  sgdisk -n {0}:{1}:{2} -t {0}:8e00 /dev/sdX' -f ($i + 1), $parts[$i].StartLba, $parts[$i].EndLba))
+    }
+    $lines.Add('')
+    $lines.Add('刷新分区表：')
+    $lines.Add('  partprobe /dev/sdX')
+    $lines.Add('  udevadm settle')
+    $lines.Add('')
+    $lines.Add('清除旧签名 + 创建 PV（逐条执行）：')
+    for ($i = 0; $i -lt $parts.Count; $i++) {
+        $n = $i + 1
+        $lines.Add(('  wipefs -a /dev/sdX{0}' -f $n))
+        $lines.Add(('  pvcreate /dev/sdX{0}' -f $n))
+    }
+    $lines.Add('')
+    $lines.Add('创建 VG / LV / 文件系统：')
+    $pvList = (0..($parts.Count - 1) | ForEach-Object { '/dev/sdX' + ($_ + 1) }) -join ' '
+    $lines.Add(('  vgcreate "$VG" {0}' -f $pvList))
+    $lines.Add('  lvcreate -l 100%FREE -n data "$VG"')
+    $lines.Add('  mkfs.ext4 -L data "/dev/$VG/data"')
+    $lines.Add('  mkdir -p /mnt/data')
+    $lines.Add('  mount "/dev/$VG/data" /mnt/data')
+    return ,$lines
 }
 
 function Write-CylinderComparison {
@@ -1585,7 +1693,8 @@ function Invoke-DiskGuard {
         [string]$ConfigPath,
         [switch]$NoBrowser,
         [switch]$SingleScan,
-        [switch]$NoAccelerator
+        [switch]$NoAccelerator,
+        [switch]$ConfirmLba
     )
 
     $script:RunClock.Reset(); $script:RunClock.Start()
@@ -1594,6 +1703,7 @@ function Invoke-DiskGuard {
     if ([string]::IsNullOrWhiteSpace($base)) { $base = (Get-Location).Path }
     if ([string]::IsNullOrWhiteSpace($ConfigPath)) { $ConfigPath = Join-Path $base 'Config.json' }
     $config = Get-DiskGuardConfig $ConfigPath
+    if ($ConfirmLba) { $config.LbaMappingConfirmed = $true }
 
     if (-not $Report1) { $Report1 = Select-Report '选择第一次扫描报告（必选）' $true }
     elseif (-not (Test-Path -LiteralPath $Report1 -PathType Leaf)) { throw "找不到第一次扫描报告：$Report1" }
@@ -1779,6 +1889,7 @@ function Invoke-DiskGuard {
                     Partition = $(if ($displayed) { $partNo } else { 0 })
                     Recommended = $recommended
                     Displayed = $displayed
+                    Lvm = $recommended
                     StartCylinder = $(if ($null -ne $chsS) { $chsS.Cylinder } else { $null })
                     StartHead = $(if ($null -ne $chsS) { $chsS.Head } else { $null })
                     StartSector = $(if ($null -ne $chsS) { $chsS.Sector } else { $null })
@@ -1801,7 +1912,12 @@ function Invoke-DiskGuard {
     $safeModel = if ([string]::IsNullOrWhiteSpace($r1.Model)) { 'UnknownDisk' } else { ($r1.Model -replace '[^\w\-]', '_') }
     $out = Join-Path $OutputRoot ("{0}_{1}" -f $safeModel, $stamp)
     New-Item -ItemType Directory -Path $out -Force | Out-Null
-    $linuxScript = Write-LinuxSetupScript -Partitions $partitions -Mapping $mapping -Config $config -OutDir $out -Model $r1.Model
+    $manualParts = @($partitions | Where-Object { $_.Displayed } | Sort-Object StartLba)
+    $lvmParts = @($partitions | Where-Object { $_.Recommended } | Sort-Object StartLba)
+    $lvmAllowed = ($lvmParts.Count -gt 0) -and $mapping.Verified -and ((-not [bool]$config.RequireConfirmedLbaForScript) -or [bool]$config.LbaMappingConfirmed -or [bool]$mapping.IndependentMatch)
+    $linuxScript = $null
+    if ($lvmAllowed) { $linuxScript = Write-LinuxSetupScript -Parts $lvmParts -Mapping $mapping -Config $config -OutDir $out -Model $r1.Model }
+    $linuxCmdLines = Get-LinuxCommandLines -Parts $lvmParts -Mapping $mapping -Config $config -Model $r1.Model -Allowed $lvmAllowed
 
     $scanRows = New-Object 'System.Collections.Generic.List[object]'
     foreach ($r in @($r1, $r2)) {
@@ -1986,62 +2102,56 @@ function Invoke-DiskGuard {
     $plan.Add('  2. 本工具只读，不会修改磁盘或分区表；分区请用 DiskGenius/diskpart 人工执行。')
     $plan.Add('  3. 分区前请先备份重要数据。')
     $plan.Add(('  4. 完整耗时：{0:N1} 秒。' -f $script:RunClock.Elapsed.TotalSeconds))
-    $plan.Add('')
-    $plan.Add('七、Linux 分区与 LVM 命令（可逐条复制执行）')
-    $linuxCmdLines = New-Object 'System.Collections.Generic.List[string]'
+        $plan.Add('')
+    $plan.Add('七、LVM 方案')
     if ($null -ne $linuxScript) {
-        $rec = @($partitions | Where-Object { $_.Displayed } | Sort-Object StartLba)
-        $modelKey = [string]$r1.Model
-        if ($modelKey -match '^HD\d+\s*:\s*') { $modelKey = $modelKey -replace '^HD\d+\s*:\s*', '' }
-        $paren = $modelKey.IndexOf('(')
-        if ($paren -gt 0) { $modelKey = $modelKey.Substring(0, $paren).Trim() }
-        $modelKey = ($modelKey -replace '[^\w\-\.]', '_')
-        if ([string]::IsNullOrWhiteSpace($modelKey)) { $modelKey = 'DISK' }
-        if ($modelKey.Length -gt 90) { $modelKey = $modelKey.Substring(0, 90) }
-
-        $linuxCmdLines.Add('设备：/dev/sdX（按实际替换；NVMe 为 /dev/nvme0n1，分区名加 p，如 /dev/nvme0n1p1）')
-        $linuxCmdLines.Add('VG 名（型号 + 当前时间）：')
-        $linuxCmdLines.Add(('  VG="vg_{0}_$(date +%Y%m%d_%H%M)"' -f $modelKey.ToLowerInvariant()))
-        $linuxCmdLines.Add('')
-        $linuxCmdLines.Add('分区（隔离带留空，逐条执行）：')
-        for ($i = 0; $i -lt $rec.Count; $i++) {
-            $pp = $rec[$i]
-            $linuxCmdLines.Add(('  sgdisk -n {0}:{1}:{2} -t {0}:8e00 /dev/sdX' -f ($i + 1), $pp.StartLba, $pp.EndLba))
-        }
-        $linuxCmdLines.Add('')
-        $linuxCmdLines.Add('刷新分区表：')
-        $linuxCmdLines.Add('  partprobe /dev/sdX')
-        $linuxCmdLines.Add('  udevadm settle')
-        $linuxCmdLines.Add('')
-        $linuxCmdLines.Add('清除旧签名 + 创建 PV（逐条执行）：')
-        for ($i = 0; $i -lt $rec.Count; $i++) {
-            $n = $i + 1
-            $linuxCmdLines.Add(('  wipefs -a /dev/sdX{0}' -f $n))
-            $linuxCmdLines.Add(('  pvcreate /dev/sdX{0}' -f $n))
-        }
-        $linuxCmdLines.Add('')
-        $linuxCmdLines.Add('创建 VG / LV / 文件系统：')
-        $pvList = (0..($rec.Count - 1) | ForEach-Object { '/dev/sdX' + ($_ + 1) }) -join ' '
-        $linuxCmdLines.Add(('  vgcreate "$VG" {0}' -f $pvList))
-        $linuxCmdLines.Add('  lvcreate -l 100%FREE -n data "$VG"')
-        $linuxCmdLines.Add('  mkfs.ext4 -L data "/dev/$VG/data"')
-        $linuxCmdLines.Add('  mkdir -p /mnt/data')
-        $linuxCmdLines.Add('  mount "/dev/$VG/data" /mnt/data')
-        $linuxCmdLines.Add('')
-        $linuxCmdLines.Add('说明：以上命令会清空目标盘分区表；执行前请确认设备名并备份。')
-        $linuxCmdLines.Add('      隔离带不要建分区；LVM 只合并空间，不修复慢区/坏道。')
-        foreach ($line in $linuxCmdLines) { $plan.Add($(if ([string]::IsNullOrEmpty($line)) { '' } else { '  ' + $line })) }
-        $plan.Add('  另：已生成 Linux_Setup.sh，可一次性执行（sudo bash Linux_Setup.sh /dev/sdX）。')
+        $plan.Add(('  已生成：Partition_Plan_LVM.txt（仅按 ≥{0} GiB 过滤，使用全部可用区间）。' -f $config.MinPartitionGiB))
+        $plan.Add('  Linux 命令与 Linux_Setup.sh 在 LVM 方案中。')
     } else {
-        $linuxCmdLines.Add('LBA 映射未验证，未生成 Linux 命令和 Linux_Setup.sh；请先处理校验问题。')
-        foreach ($line in $linuxCmdLines) { $plan.Add(('  ' + $line)) }
+        $plan.Add('  LVM 方案见 Partition_Plan_LVM.txt；未生成破坏性命令（LBA 映射未确认）。')
     }
-    [System.IO.File]::WriteAllLines((Join-Path $out 'Partition_Plan.txt'), $plan.ToArray(), [System.Text.Encoding]::UTF8)
+[System.IO.File]::WriteAllLines((Join-Path $out 'Partition_Plan.txt'), $plan.ToArray(), [System.Text.Encoding]::UTF8)
+    # ---- LVM 方案（仅按绝对值过滤） ----
+    $lvmPlan = New-Object 'System.Collections.Generic.List[string]'
+    $lvmPlan.Add('DiskGuard LVM 方案')
+    $lvmPlan.Add('================')
+    $lvmPlan.Add(('生成时间：{0}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')))
+    $lvmPlan.Add(('磁盘：{0}' -f $r1.Model))
+    $lvmPlan.Add(('总容量：{0:N2} GiB（{1} 扇区，逻辑扇区 {2} 字节）' -f (($mapping.CapacitySectors * [double]$config.LogicalSectorBytes) / 1073741824.0), $mapping.CapacitySectors, $config.LogicalSectorBytes))
+    $lvmPlan.Add(('LBA 映射：{0}（{1}）' -f $(if ($mapping.Verified) { '已验证' } else { '未验证' }), $mapping.VerificationLevel))
+    $lvmPlan.Add(('LBA 人工确认：{0}' -f $(if ([bool]$config.LbaMappingConfirmed) { '是' } else { '否' })))
+    $lvmPlan.Add(('过滤条件：仅 ≥ {0} GiB（MinPartitionGiB），不使用百分比过滤' -f $config.MinPartitionGiB))
+    $lvmPlan.Add(('破坏性命令：{0}' -f $(if ($lvmAllowed) { '已生成' } else { '未生成（需要 LBA 确认或独立证据）' })))
+    $lvmPlan.Add('')
+    $lvmSum = if ($lvmParts.Count -gt 0) { ($lvmParts | Measure-Object -Property SizeGiB -Sum).Sum } else { 0.0 }
+    $lvmPlan.Add(('一、LVM PV 列表（{0} 个，合计 {1:N2} GiB）' -f $lvmParts.Count, $lvmSum))
+    $lvmPlan.Add('  序号 | 容量 | 占比 | 起始柱面 | 磁头 | 扇区 | 起始扇区号 | 总扇区数 | 结束柱面 | 结束磁头 | 结束扇区')
+    for ($i = 0; $i -lt $lvmParts.Count; $i++) {
+        $pp = $lvmParts[$i]
+        $lvmPlan.Add(('  {0,4} | {1,9:N2} GiB | {2,6:N2}% | {3,8} | {4,3} | {5,3} | {6,12} | {7,12} | {8,8} | {9,3} | {10,3}' -f ($i + 1), $pp.SizeGiB, $pp.Percent, $pp.StartCylinder, $pp.StartHead, $pp.StartSector, $pp.StartLba, $pp.TotalSectors, $pp.EndCylinder, $pp.EndHead, $pp.EndSector))
+    }
+    $lvmPlan.Add('  说明：隔离带不建分区；各 PV 彼此独立，不能跨越隔离区间。')
+    $lvmPlan.Add('')
+    $lvmPlan.Add(('二、隔离区间（{0} 个，不建分区）' -f $iso.Ranges.Count))
+    foreach ($rg in $iso.Ranges) {
+        $lvmPlan.Add(('  #{0} 柱面 {1}-{2} 风险 {3}' -f $rg.RangeId, $rg.StartCylinder, $rg.EndCylinder, $rg.Risk))
+    }
+    $lvmPlan.Add('')
+    $lvmPlan.Add('三、Linux 命令')
+    foreach ($line in $linuxCmdLines) { $lvmPlan.Add($(if ([string]::IsNullOrEmpty($line)) { '' } else { '  ' + $line })) }
+    $lvmPlan.Add('')
+    $lvmPlan.Add('四、安全说明')
+    $lvmPlan.Add('  1. Linux_Setup.sh 和上述命令会清空目标盘分区表；执行前请确认设备名并备份。')
+    $lvmPlan.Add('  2. 脚本会校验容量、逻辑扇区大小、型号、挂载点、swap、VG 冲突和系统盘占用。')
+    $lvmPlan.Add('  3. 逐条命令不包含脚本中的自动检查；优先执行 Linux_Setup.sh。')
+    $lvmPlan.Add('  4. 隔离带保持未分配；LVM 只合并空间，不修复慢区/坏道。')
+    $lvmPlan.Add('  5. 单盘 LVM 无冗余；重要数据请另做备份。')
+    [System.IO.File]::WriteAllLines((Join-Path $out 'Partition_Plan_LVM.txt'), $lvmPlan.ToArray(), [System.Text.Encoding]::UTF8)
 
     if ($partitions.Count -gt 0) {
-        Write-CsvFile -Path (Join-Path $out 'Partition_Scheme.csv') -Columns @('Partition', 'Recommended', 'StartCylinder', 'StartHead', 'StartSector', 'StartLba', 'TotalSectors', 'EndCylinder', 'EndHead', 'EndSector', 'EndLba', 'SizeGiB', 'Percent', 'Displayed') -Rows $partitions
+        Write-CsvFile -Path (Join-Path $out 'Partition_Scheme.csv') -Columns @('Partition', 'Recommended', 'Displayed', 'Lvm', 'StartCylinder', 'StartHead', 'StartSector', 'StartLba', 'TotalSectors', 'EndCylinder', 'EndHead', 'EndSector', 'EndLba', 'SizeGiB', 'Percent') -Rows $partitions
     } else {
-        [System.IO.File]::WriteAllText((Join-Path $out 'Partition_Scheme.csv'), 'Partition,Recommended,StartCylinder,StartHead,StartSector,StartLba,TotalSectors,EndCylinder,EndHead,EndSector,EndLba,SizeGiB,Percent', (New-Object System.Text.UTF8Encoding($true)))
+        [System.IO.File]::WriteAllText((Join-Path $out 'Partition_Scheme.csv'), 'Partition,Recommended,Displayed,Lvm,StartCylinder,StartHead,StartSector,StartLba,TotalSectors,EndCylinder,EndHead,EndSector,EndLba,SizeGiB,Percent', (New-Object System.Text.UTF8Encoding($true)))
     }
 
 # ---- HTML（简洁版） ----
@@ -2059,7 +2169,7 @@ function Invoke-DiskGuard {
     [void]$h.Append(('<tr><th>记录 / 错误</th><td>{0} / {1}</td></tr>' -f $r1.Count, $r1.ErrorCount))
     [void]$h.Append('</table>')
 
-    [void]$h.Append('<h2>分区方案（1 MiB 对齐；GPT 首尾各保留 34 扇区）</h2>')
+    [void]$h.Append(('<h2>手工分区方案（{0}% + {1} GiB）</h2>' -f $config.MinPartitionPercent, $config.MinPartitionGiB))
     if (-not $mapping.Verified) {
         [void]$h.Append('<p class="muted">未通过 LBA 映射验证，无法给出分区方案。</p>')
     } elseif ($partitions.Count -eq 0) {
@@ -2098,11 +2208,22 @@ function Invoke-DiskGuard {
         [void]$h.Append(('<p class="muted">显示阈值：分区容量 ≥ 硬盘总容量的 {0}%，且 ≥ {1} GiB。柱面/磁头/扇区为 255/63 传统几何；起始扇区号为绝对 LBA。</p>' -f $config.MinPartitionPercent, $config.MinPartitionGiB))
     }
 
-    [void]$h.Append('<h2>Linux 分区与 LVM</h2>')
-    if ($null -ne $linuxScript) {
-        [void]$h.Append('<p class="muted">以下命令可逐条复制执行；也可直接运行 <a href="Linux_Setup.sh">Linux_Setup.sh</a>。VG 名为“型号 + 当前时间”。命令会清空目标盘分区表，执行前请确认设备名并备份。</p>')
+    [void]$h.Append(('<h2>LVM 方案（仅 ≥{0} GiB）</h2>' -f $config.MinPartitionGiB))
+    if ($lvmParts.Count -eq 0) {
+        [void]$h.Append(('<p class="muted">没有 ≥ {0} GiB 的可用区间。</p>' -f $config.MinPartitionGiB))
     } else {
-        [void]$h.Append('<p class="muted">LBA 映射未验证，未生成 Linux 命令和 Linux_Setup.sh。</p>')
+        [void]$h.Append(('<p class="muted">共 {0} 个 PV，合计 {1:N2} GiB；不使用百分比过滤。</p>' -f $lvmParts.Count, $lvmSum))
+        [void]$h.Append('<table><thead><tr><th>序号</th><th>容量</th><th>占比</th><th>起始柱面</th><th>磁头</th><th>扇区</th><th>起始扇区号</th><th>总扇区数</th><th>结束柱面</th><th>结束磁头</th><th>结束扇区</th></tr></thead><tbody>')
+        for ($li = 0; $li -lt $lvmParts.Count; $li++) {
+            $lp = $lvmParts[$li]
+            [void]$h.Append(('<tr><td>{0}</td><td>{1:N2} GiB</td><td>{2:N2}%</td><td>{3}</td><td>{4}</td><td>{5}</td><td><code>{6}</code></td><td>{7}</td><td>{8}</td><td>{9}</td><td>{10}</td></tr>' -f ($li + 1), $lp.SizeGiB, $lp.Percent, $lp.StartCylinder, $lp.StartHead, $lp.StartSector, $lp.StartLba, $lp.TotalSectors, $lp.EndCylinder, $lp.EndHead, $lp.EndSector))
+        }
+        [void]$h.Append('</tbody></table>')
+    }
+    if ($null -ne $linuxScript) {
+        [void]$h.Append('<p class="muted">已生成 <a href="Linux_Setup.sh">Linux_Setup.sh</a>；以下命令也可逐条复制。命令会清空目标盘分区表，执行前请确认设备名并备份。</p>')
+    } else {
+        [void]$h.Append('<p class="muted">LBA 映射未达到破坏性操作要求，未生成 Linux 命令和 Linux_Setup.sh。可在 Config.json 设 LbaMappingConfirmed=true，或运行时加 -ConfirmLba。</p>')
     }
     [void]$h.Append('<pre class="cmd">' + (& $enc (($linuxCmdLines -join "`n"))) + '</pre>')
     [void]$h.Append('<h2>必须避开的隔离区间</h2><table><thead><tr><th>序号</th><th>柱面范围</th><th>风险</th><th>扫描1最大</th><th>扫描2最大</th><th>异常点</th><th>区域P95</th><th>每侧扩展</th><th>原因</th></tr></thead><tbody>')
@@ -2164,7 +2285,7 @@ function Invoke-DiskGuard {
 if ($MyInvocation.InvocationName -ne '.') {
     $exitCode = 0
     try {
-        Invoke-DiskGuard -Report1 $Report1 -Report2 $Report2 -OutputRoot $OutputRoot -NoBrowser:$NoBrowser -SingleScan:$SingleScan -NoAccelerator:$NoAccelerator
+        Invoke-DiskGuard -Report1 $Report1 -Report2 $Report2 -OutputRoot $OutputRoot -NoBrowser:$NoBrowser -SingleScan:$SingleScan -NoAccelerator:$NoAccelerator -ConfirmLba:$ConfirmLba
     } catch {
         $message = $_.Exception.Message
         Write-Fail $message

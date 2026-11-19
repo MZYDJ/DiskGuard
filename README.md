@@ -15,7 +15,7 @@ DiskGuard 读取 DiskGenius 导出的 TXT 扫描报告，区分「明确读取�
 - **不过度隔离**：单个柱面即使两次都偏慢，只要未达临界幅度且不构成密集区域，只列入观察。
 - **LBA 安全**：10 项结构证据 + 物理盘独立证据；任一不通过只给柱面范围。
 - **可配置**：阈值、窗口、聚类、隔离带、风险策略、显示阈值都在 `Config.json`。
-- **自带测试**：38 项自动化测试，覆盖规范要求的 20 类场景 + 边界条件 + 真实报告验收。
+- **自带测试**：41 项自动化测试，覆盖规范要求的 20 类场景 + 边界条件 + 真实报告验收。
 
 ## 快速开始
 
@@ -43,15 +43,16 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\DiskGuard.ps1 `
 
 | 文件 | 内容 |
 |---|---|
-| `Partition_Plan.txt` | **主输出**：磁盘信息 → 分区方案（含容量、占比、CHS、LBA、总扇区数）→ 隔离区间 → 异常柱面明细 → 读取错误 → 校验说明 |
-| `Partition_Scheme.csv` | 分区方案表格版，`Displayed` 列标记是否在方案中显示 |
+| `Partition_Plan.txt` | **手工方案**：磁盘信息 → 分区方案（5% + 2 GiB）→ 隔离区间 → 异常柱面明细 → 读取错误 → 校验说明 |
+| `Partition_Plan_LVM.txt` | **LVM 方案**：全部 ≥2 GiB 的 PV、隔离区间、Linux 命令（需 LBA 确认） |
+| `Partition_Scheme.csv` | 全部区间：`Recommended`（≥2 GiB）、`Displayed`（手工 5%）、`Lvm`（=Recommended） |
 | `Analysis_Report.html` | 同上的简洁网页版（无图表，纯表格） |
 | `Isolation_Ranges.csv` | 隔离区间汇总（柱面 + LBA + 最大延迟 + 原因） |
 | `Isolation_Anomalies.csv` | 每个隔离区里的异常柱面号与两次扫描值 |
 | `Anomaly_Clusters.csv` | 异常簇 / 连续慢区的区域指标与风险等级 |
 | `Anomaly_Details.csv` | 每个异常柱面的类别、延迟、局部阈值 |
 | `Scan_Comparison.csv` | 每次扫描的统计基线（中位数、MAD、P99、阈值等） |
-| `Linux_Setup.sh` | 映射验证通过时生成：Linux GPT 分区 + LVM 命令（VG 名从型号 + 时间生成） |
+| `Linux_Setup.sh` | LBA 确认后生成：Linux GPT 分区 + LVM 命令（VG 名从型号 + 时间生成） |
 | `Analysis.log` | 阶段耗时、校验结果、未解析行、警告 |
 
 `Cylinder_Comparison.csv`（5 MB 逐柱面对照）默认不生成，需要时把
@@ -69,40 +70,61 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\DiskGuard.ps1 `
 - 分区之间会列出夹在中间的隔离区：异常柱面 ≤5 个时逐条写 `柱面=扫描1/扫描2`，
   超过 5 个只写 `共 N 个异常点，最大 扫描1/扫描2`。
 
-## Linux 分区与 LVM
+## 两份分区方案
 
-LBA 映射验证通过时，`Partition_Plan.txt` 的第七节会直接列出**可逐条复制执行**的命令；
-同时输出目录会多一个 `Linux_Setup.sh`（UTF-8 无 BOM、LF 换行），可一次性执行：
+LBA 映射验证通过后，输出目录会生成两份方案：
 
-```bash
-sudo bash Linux_Setup.sh /dev/sdX
+| 文件 | 用途 | 过滤条件 |
+|---|---|---|
+| `Partition_Plan.txt` | 手工分区/维护 | `MinPartitionPercent`（默认 5%）且 `MinPartitionGiB`（默认 2 GiB） |
+| `Partition_Plan_LVM.txt` | LVM 管理 | 仅 `MinPartitionGiB`（默认 2 GiB），使用全部可用区间 |
+
+`Partition_Plan_LVM.txt` 包含全部 PV 的起止 LBA/CHS、隔离区间清单、可逐条复制的 Linux 命令，
+以及 `Linux_Setup.sh` 的说明。
+
+### 破坏性内容的确认门槛
+
+`Linux_Setup.sh` 和 LVM 报告里的命令会清空目标盘，默认要求 LBA 映射已经人工确认：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\DiskGuard.ps1 `
+    -Report1 ... -Report2 ... -ConfirmLba
 ```
 
-报告里的命令按分区逐条列出，方便只执行其中一部分。脚本只使用 `Displayed=true` 的分区（同时满足 `MinPartitionGiB` 和 `MinPartitionPercent`）。脚本会：
+或在 `Config.json` 里设 `LbaMappingConfirmed: true`。没有确认时：
 
-1. 校验目标盘是块设备、容量与报告总扇区数一致、没有挂载点、不是当前系统盘；
-2. 用 `sgdisk` 只在可用区间建 GPT 分区（类型 `8e00`），隔离带保持未分配；
-3. `wipefs` → `pvcreate` → `vgcreate` → `lvcreate` → `mkfs.ext4`；
-4. VG 名为 `vg_<型号>_<yyyymmdd_hhmm>`：型号取自报告（如 `ST3500418AS` → `st3500418as`），
-   时间取执行时刻。
+- 手工方案照常生成；
+- LVM 方案只列 PV 和隔离区，不生成命令和脚本；
+- 报告会写明原因。
+
+### 脚本的安全检查
+
+`Linux_Setup.sh` 在第一次写盘之前完成：
+
+1. 依赖命令检查；
+2. `blockdev --getsize64` 容量（字节）和 `--getss` 逻辑扇区大小；
+3. `lsblk` 型号比对，并显示型号/序列号/WWN；
+4. 沿 `findmnt` + `lsblk -s` + `/proc/swaps` 检查目标盘是否被系统使用；
+5. VG 名冲突检查（`vgs`）；
+6. 输入完整设备路径 + `YES` 二次确认。
+
+VG 名为 `vg_<型号>_<yyyymmdd_hhmmss>`，型号清洗为 ASCII，读不到时用 `disk`。
 
 示例：
 
 ```bash
-VG="vg_st3500418as_$(date +%Y%m%d_%H%M)"
-
+VG="vg_st3500418as_$(date +%Y%m%d_%H%M%S)"
 sgdisk -n 1:2781184:44161023 -t 1:8e00 /dev/sdX
 ...
 pvcreate /dev/sdX1
 ...
-vgcreate "$VG" /dev/sdX1 ... /dev/sdX15
+vgcreate "$VG" /dev/sdX1 ... /dev/sdX11
 lvcreate -l 100%FREE -n data "$VG"
 mkfs.ext4 -L data "/dev/$VG/data"
 ```
 
 注意：脚本是**破坏性**的，会清空目标盘分区表；执行前请确认设备名并备份。
 LVM 只合并空间，不修复慢区/坏道；隔离带仍然空着。
-
 ## 配置
 
 `Config.json`（默认值）：
@@ -128,14 +150,15 @@ LVM 只合并空间，不修复慢区/坏道；隔离带仍然空着。
 | `MinBackgroundSpan` | 20 | 连续慢区最小跨度 |
 | `MinBackgroundFill` | 0.5 | 背景慢区最小填充率（异常柱面 ÷ 跨度） |
 | `RiskProfile` | `strict` | 风险策略：`strict` / `standard` / `errors-only` |
-| `MinPartitionGiB` | 2.0 | 小于该容量的区间不创建（碎片） |
-| `MinPartitionPercent` | 5.0 | 分区方案和 Linux 脚本只使用容量占比 ≥ 该值的分区 |
+| `MinPartitionGiB` | 2.0 | 小于该容量的区间不创建（碎片）；LVM 也只使用 ≥ 该值的区间 |
+| `MinPartitionPercent` | 5.0 | 手工方案的显示阈值；不影响 LVM 方案 |
 | `HeadsPerCylinder` / `SectorsPerTrack` | 255 / 63 | CHS 几何 |
 | `GuardErrorMiB` | 1024 | 明确错误每侧隔离带 |
 | `GuardExtremeMiB` | 512 | 极端异常每侧隔离带 |
 | `GuardRepeatedMiB` | 256 | 高密度异常区每侧隔离带 |
 | `GuardBackgroundMiB` | 512 | 连续慢区每侧隔离带 |
 | `RequireManualLbaConfirmation` | `false` | 是否强制人工确认 LBA 映射 |
+| `RequireConfirmedLbaForScript` | `true` | 生成 Linux 脚本/命令前是否要求 LBA 已确认 |
 | `RequireIndependentLbaEvidence` | `false` | 是否要求物理盘独立证据一致才输出 LBA |
 | `LbaMappingConfirmed` | `false` | 人工确认标记 |
 | `WriteCylinderComparison` | `false` | 是否输出 5 MB 逐柱面对照 CSV |
@@ -188,7 +211,7 @@ LBA 映射：已验证（结构验证通过（未找到匹配物理盘，未做�
 ```
 
 任何一项不通过时只输出柱面范围，避免给出「看起来能用、实际会分错位置」的分区表。
-`RequireManualLbaConfirmation=true` 可再加一道人工签字；
+`RequireManualLbaConfirmation=true` 可再加一道人工签字；生成 Linux 脚本/命令还需要 `LbaMappingConfirmed=true` 或运行时 `-ConfirmLba`（`RequireConfirmedLbaForScript=true` 时）。
 `RequireIndependentLbaEvidence=true` 要求物理盘独立证据必须一致，否则不输出 LBA。
 
 ## 算法流水线
@@ -222,6 +245,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Tests\DiskGuard.Tests.
 
 全部通过时退出码为 0。加速内核不可用时，测试 22 会打印 SKIP，不判失败。
 
+Linux 侧另有 `.github/workflows/linux-tests.yml`：在 `ubuntu-latest` 上安装 `gdisk`/`lvm2`，
+对 `Tests/fixtures/Linux_Setup.sh` 做 `bash -n`，再用 loop device 执行
+GPT → PV → VG → LV → ext4 的端到端测试（`Tests/LinuxIntegration.sh`）。
+
 ## 性能基准
 
 本机实测（Windows 10.0.19041，PowerShell 5.1.19041.6093，8 核）：
@@ -245,7 +272,7 @@ DiskGuard.ps1                     主程序（Windows PowerShell 5.1）
 DiskGuard_启动.cmd                双击启动入口
 Config.json                       可调整参数
 README.md                         本文件
-Tests\DiskGuard.Tests.ps1         自动化测试（38 项）
+Tests\DiskGuard.Tests.ps1         自动化测试（41 项）
 Tests\Benchmark.ps1               性能基准（可选）
 DiskGuard_算法设计与实现规范_v1.0.md   算法设计规范
 ```
