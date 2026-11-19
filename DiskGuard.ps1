@@ -28,6 +28,8 @@ $script:RunClock = New-Object System.Diagnostics.Stopwatch
 $script:StageClock = New-Object System.Diagnostics.Stopwatch
 $script:FailureLog = $null
 $script:Accelerated = $false
+$script:PhysicalDiskCache = $null
+$script:PhysicalDiskCacheError = $null
 $script:Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $script:MiB = 1048576.0
 
@@ -91,6 +93,7 @@ function Get-DiskGuardConfig([string]$Path) {
         ContextCylinders              = 10
         RegionSlowRatio               = 1.5
         MinBackgroundSpan             = 20
+        MinBackgroundFill             = 0.5
         GuardBackgroundMiB            = 512
         RiskProfile                   = 'strict'
         MinPartitionGiB               = 1.0
@@ -106,6 +109,7 @@ function Get-DiskGuardConfig([string]$Path) {
         SectorsPerCylinderOverride    = $null
         LbaMappingConfirmed           = $false
         RequireManualLbaConfirmation  = $false
+        RequireIndependentLbaEvidence = $false
     }
     if (Test-Path -LiteralPath $Path -PathType Leaf) {
         try {
@@ -621,6 +625,7 @@ function Parse-Report {
         Flags = $null
         Validation = (New-Object 'System.Collections.Generic.List[object]')
         Fatal = $false
+        MappingBlocked = $false
     }
     return $report
 }
@@ -634,38 +639,67 @@ function Test-ReportStructure {
     $v = $Report.Validation
     $v.Clear()
     $fatal = $false
+    $mappingBlocked = $false
     function Add-Check([string]$Level, [string]$Message) {
         $v.Add([pscustomobject]@{ Level = $Level; Message = $Message })
-        if ($Level -eq 'error') { $script:StructFatal = $true }
     }
-    $script:StructFatal = $false
 
     if ([string]::IsNullOrWhiteSpace($Report.Model)) {
         Add-Check 'warning' '报告未识别出磁盘型号。'
     }
     if ($null -eq $Report.RangeStart -or $null -eq $Report.RangeEnd) {
         Add-Check 'warning' '报告未识别出扫描范围，LBA 映射无法验证。'
+        $mappingBlocked = $true
     } else {
         $expected = $Report.RangeEnd - $Report.RangeStart + 1
         if ($expected -ne $Report.Count) {
             Add-Check 'warning' ("扫描范围声明为 {0} 个柱面，实际解析 {1} 条记录。" -f $expected, $Report.Count)
+            $mappingBlocked = $true
+        }
+        $actualLast = [int64]$Report.Cylinder[$Report.Count - 1]
+        if ($actualLast -ne [int64]$Report.RangeEnd) {
+            Add-Check 'warning' ("声明扫描末端为柱面 {0}，实际最后柱面为 {1}。" -f $Report.RangeEnd, $actualLast)
+            $mappingBlocked = $true
         }
         if (-not $Report.StartsAtZero) {
             Add-Check 'warning' ("扫描未从柱面 0 开始（起始柱面 {0}），不能直接套用 LBA=C*S 映射。" -f $Report.Cylinder[0])
+            $mappingBlocked = $true
         }
     }
     if ($Report.DuplicateCount -gt 0) {
         Add-Check 'error' ("存在 {0} 条重复柱面记录（例如柱面 {1}），已保留首条。" -f $Report.DuplicateCount, $Report.Duplicates[0].Cylinder)
+        $mappingBlocked = $true
     }
     if ($Report.MissingCount -gt 0) {
         Add-Check 'warning' ("柱面编号不连续，缺失 {0} 个柱面。" -f $Report.MissingCount)
+        $mappingBlocked = $true
     }
-    if (-not $Report.Contiguous) { Add-Check 'warning' '柱面记录不连续，LBA 映射需要人工确认。' }
+    if (-not $Report.Contiguous) {
+        Add-Check 'warning' '柱面记录不连续，LBA 映射需要人工确认。'
+        $mappingBlocked = $true
+    }
     if ($Report.SectorsPerCylinder -le 0) {
         Add-Check 'error' '无法确定每柱面扇区数。'
+        $fatal = $true
     }
     if ($Report.LastCylinderSectors -gt $Report.SectorsPerCylinder) {
         Add-Check 'error' '最后一个柱面的扇区数大于常规柱面，记录结构异常。'
+        $fatal = $true
+    }
+    # 非末柱面扇区数逐条一致性
+    $badSectors = 0
+    $badSample = $null
+    if ($Report.SectorsPerCylinder -gt 0) {
+        for ($i = 0; $i -lt ($Report.Count - 1); $i++) {
+            if ($Report.SectorCount[$i] -ne $Report.SectorsPerCylinder) {
+                $badSectors++
+                if ($null -eq $badSample) { $badSample = $Report.Cylinder[$i] }
+            }
+        }
+    }
+    if ($badSectors -gt 0) {
+        Add-Check 'error' ("有 {0} 个非末柱面的扇区数不等于 {1}（例如柱面 {2}）。" -f $badSectors, $Report.SectorsPerCylinder, $badSample)
+        $mappingBlocked = $true
     }
     if ($null -ne $Report.DeclaredNormal -and $Report.DeclaredNormal -ne ($Report.Count - $Report.ErrorCount)) {
         Add-Check 'warning' ("报告声明 {0} 条正常磁道，实际解析 {1} 条正常记录。" -f $Report.DeclaredNormal, ($Report.Count - $Report.ErrorCount))
@@ -682,13 +716,27 @@ function Test-ReportStructure {
     if ($Report.Stats.ScaleGuard) {
         Add-Check 'info' ("MAD 过小，已启用最小稳健尺度保护（{0} ms）。" -f $Config.MinRobustSigmaMs)
     }
-    $Report.Fatal = $script:StructFatal
+    $Report.Fatal = $fatal
+    $Report.MappingBlocked = $mappingBlocked
     return $Report
 }
 
 # ---------------------------------------------------------------------------
 # 异常检测
 # ---------------------------------------------------------------------------
+function New-EmptyLocalStats([int]$Count) {
+    $med = New-Object double[] $Count
+    $thr = New-Object double[] $Count
+    $p99 = New-Object double[] $Count
+    $flag = New-Object bool[] $Count
+    for ($i = 0; $i -lt $Count; $i++) {
+        $med[$i] = [double]::NaN
+        $thr[$i] = [double]::NaN
+        $p99[$i] = [double]::NaN
+    }
+    return [pscustomobject]@{ Median = $med; Threshold = $thr; P99 = $p99; Flag = $flag }
+}
+
 function Add-DetectionFlags {
     param($Report, $Config)
 
@@ -699,8 +747,14 @@ function Add-DetectionFlags {
     $valid = New-Object bool[] $n
     for ($i = 0; $i -lt $n; $i++) { $valid[$i] = (-not $isErr[$i]) -and (-not [double]::IsNaN($ms[$i])) }
 
-    $small = Get-LocalStats -ReadMs $ms -Valid $valid -Radius ([int]$Config.LocalWindowSmall) -K ([double]$Config.LocalK) -MinSigma ([double]$Config.LocalMinSigmaMs) -RatioMin ([double]$Config.LocalRatioMin) -MinDelta ([double]$Config.LocalMinDeltaMs) -MinSamples ([int]$Config.LocalMinSamples)
-    $large = Get-LocalStats -ReadMs $ms -Valid $valid -Radius ([int]$Config.LocalWindowLarge) -K ([double]$Config.LocalK) -MinSigma ([double]$Config.LocalMinSigmaMs) -RatioMin ([double]$Config.LocalRatioMin) -MinDelta ([double]$Config.LocalMinDeltaMs) -MinSamples ([int]$Config.LocalMinSamples)
+    if ((-not $Report.Contiguous) -or ($Report.MissingCount -gt 0)) {
+        $small = New-EmptyLocalStats $n
+        $large = New-EmptyLocalStats $n
+        $Report.Validation.Add([pscustomobject]@{ Level = 'warning'; Message = '柱面记录不连续，已跳过局部异常检测（避免按记录索引近似柱面邻域）。' })
+    } else {
+        $small = Get-LocalStats -ReadMs $ms -Valid $valid -Radius ([int]$Config.LocalWindowSmall) -K ([double]$Config.LocalK) -MinSigma ([double]$Config.LocalMinSigmaMs) -RatioMin ([double]$Config.LocalRatioMin) -MinDelta ([double]$Config.LocalMinDeltaMs) -MinSamples ([int]$Config.LocalMinSamples)
+        $large = Get-LocalStats -ReadMs $ms -Valid $valid -Radius ([int]$Config.LocalWindowLarge) -K ([double]$Config.LocalK) -MinSigma ([double]$Config.LocalMinSigmaMs) -RatioMin ([double]$Config.LocalRatioMin) -MinDelta ([double]$Config.LocalMinDeltaMs) -MinSamples ([int]$Config.LocalMinSamples)
+    }
 
     $globalFlag = New-Object bool[] $n
     $extremeFlag = New-Object bool[] $n
@@ -777,8 +831,10 @@ function Get-ClusterMetrics {
     param([int64]$StartCyl, [int64]$EndCyl, [int64[]]$Members, $R1, $R2, $Config)
 
     $pad = [int64]$Config.ContextCylinders
-    $ctxStart = [Math]::Max([int64]0, $StartCyl - $pad)
-    $ctxEnd = [Math]::Min([int64]($R1.Count - 1), $EndCyl + $pad)
+    $firstCyl = [int64]$R1.Cylinder[0]
+    $lastCyl = [int64]$R1.Cylinder[$R1.Count - 1]
+    $ctxStart = [Math]::Max($firstCyl, $StartCyl - $pad)
+    $ctxEnd = [Math]::Min($lastCyl, $EndCyl + $pad)
 
     $idx1 = $R1.CylinderIndex
     $idx2 = $null
@@ -786,8 +842,9 @@ function Get-ClusterMetrics {
 
     $vals1 = New-Object 'System.Collections.Generic.List[double]'
     $vals2 = New-Object 'System.Collections.Generic.List[double]'
+    $errSet = New-Object 'System.Collections.Generic.HashSet[int64]'
     $maxMs1 = 0.0; $maxMs2 = 0.0
-    $errCount = 0; $extreme1 = $false; $extreme2 = $false
+    $extreme1 = $false; $extreme2 = $false
     $crit1 = $false; $crit2 = $false
     $global1 = 0; $global2 = 0; $local1 = 0; $local2 = 0
     $critMs = $R1.Stats.Critical
@@ -821,7 +878,7 @@ function Get-ClusterMetrics {
                 if ($R2.Flags.Local[$k2]) { $local2++ }
             }
         }
-        if ($errHere) { $errCount++ }
+        if ($errHere) { [void]$errSet.Add([int64]$c) }
     }
 
     # 区域背景指标（含异常点前后 ContextCylinders 个柱面）
@@ -842,7 +899,10 @@ function Get-ClusterMetrics {
     $r2arr = $region2.ToArray(); [Array]::Sort($r2arr)
 
     $span = [int64]($EndCyl - $StartCyl + 1)
-    $repeat = ($null -ne $R2) -and ($global1 + $local1 + $errCount -gt 0) -and ($global2 + $local2 -gt 0)
+    $repeat = ($null -ne $R2) -and (($global1 + $local1 + $errSet.Count) -gt 0) -and (($global2 + $local2) -gt 0)
+    $errArr = New-Object 'int64[]' $errSet.Count
+    $errSet.CopyTo($errArr)
+
     $maxGap = [int64]0
     for ($i = 1; $i -lt $Members.Length; $i++) {
         $g = $Members[$i] - $Members[$i - 1]
@@ -856,7 +916,8 @@ function Get-ClusterMetrics {
         Span = $span
         PointCount = $Members.Length
         Members = $Members
-        ErrorPoints = $errCount
+        ErrorPoints = $errSet.Count
+        ErrorCylinders = $errArr
         Extreme1 = $extreme1
         Extreme2 = $extreme2
         Critical1 = $crit1
@@ -872,6 +933,7 @@ function Get-ClusterMetrics {
         RegionMedian2 = (Get-PercentileSorted $r2arr 0.5)
         RegionP952 = (Get-PercentileSorted $r2arr 0.95)
         Density = ($Members.Length / [double]$span)
+        Fill = 0.0
         MaxGap = $maxGap
         Repeat = $repeat
         Risk = 'N'
@@ -947,58 +1009,89 @@ function Apply-RiskProfile {
 # ---------------------------------------------------------------------------
 # 区域整体偏慢（大窗口基线显著高于全盘基线）
 # ---------------------------------------------------------------------------
+function Get-BackgroundRuns {
+    param($Report, $Config)
+    $runs = New-Object 'System.Collections.Generic.List[object]'
+    if ($null -eq $Report -or $null -eq $Report.Flags) { return ,$runs }
+    $bg = $Report.Flags.Background
+    $gap = [int64]$Config.TightClusterCylinders
+    $start = $null
+    $prev = $null
+    $members = New-Object 'System.Collections.Generic.List[int64]'
+    for ($i = 0; $i -lt $Report.Count; $i++) {
+        if (-not $bg[$i]) { continue }
+        $c = [int64]$Report.Cylinder[$i]
+        if ($null -ne $start -and ($c - $prev) -gt $gap) {
+            $span = [int64]($prev - $start + 1)
+            $runs.Add([pscustomobject]@{ Start = $start; End = $prev; Members = $members.ToArray(); Span = $span; Fill = ($members.Count / [double]$span) })
+            $members = New-Object 'System.Collections.Generic.List[int64]'
+            $start = $c
+        } elseif ($null -eq $start) {
+            $start = $c
+        }
+        $members.Add($c)
+        $prev = $c
+    }
+    if ($null -ne $start) {
+        $span = [int64]($prev - $start + 1)
+        $runs.Add([pscustomobject]@{ Start = $start; End = $prev; Members = $members.ToArray(); Span = $span; Fill = ($members.Count / [double]$span) })
+    }
+    return ,$runs
+}
+
 function Get-BackgroundRegions {
     param($R1, $R2, $Config)
     $out = New-Object 'System.Collections.Generic.List[object]'
-    $n = $R1.Count
-    $bg1 = $R1.Flags.Background
-    $gap = [int64]$Config.TightClusterCylinders
     $minSpan = [int64]$Config.MinBackgroundSpan
-    $runs = New-Object 'System.Collections.Generic.List[object]'
-    $start = $null; $prev = $null
-    for ($i = 0; $i -lt $n; $i++) {
-        if (-not $bg1[$i]) { continue }
-        $c = $R1.Cylinder[$i]
-        if ($null -eq $start) { $start = $c; $prev = $c; continue }
-        if (($c - $prev) -gt $gap) {
-            $runs.Add([pscustomobject]@{ Start = $start; End = $prev })
-            $start = $c
-        }
-        $prev = $c
-    }
-    if ($null -ne $start) { $runs.Add([pscustomobject]@{ Start = $start; End = $prev }) }
+    $minFill = [double]$Config.MinBackgroundFill
+    $runs1 = Get-BackgroundRuns -Report $R1 -Config $Config
+    $runs2 = New-Object 'System.Collections.Generic.List[object]'
+    if ($null -ne $R2) { $runs2 = Get-BackgroundRuns -Report $R2 -Config $Config }
+    $used2 = New-Object 'System.Collections.Generic.HashSet[int]'
 
-    foreach ($run in $runs) {
-        $span = [int64]($run.End - $run.Start + 1)
-        if ($span -lt $minSpan) { continue }
-        $members = New-Object 'System.Collections.Generic.List[int64]'
-        for ($c = $run.Start; $c -le $run.End; $c++) { $members.Add($c) }
-        $cl = Get-ClusterMetrics -StartCyl $run.Start -EndCyl $run.End -Members $members.ToArray() -R1 $R1 -R2 $R2 -Config $Config
-        $cl.Kind = 'Background'
+    foreach ($run in $runs1) {
+        if ($run.Span -lt $minSpan) { continue }
+        if ($run.Fill -lt $minFill) { continue }
         $bothScans = $false
-        if ($null -ne $R2) {
-            $bg2 = $R2.Flags.Background
-            $slow = 0; $tot = 0
-            for ($c = $run.Start; $c -le $run.End; $c++) {
-                $key = [string]$c
-                if ($R2.CylinderIndex.ContainsKey($key)) {
-                    $tot++
-                    if ($bg2[$R2.CylinderIndex[$key]]) { $slow++ }
-                }
+        for ($j = 0; $j -lt $runs2.Count; $j++) {
+            $other = $runs2[$j]
+            $overlap = [Math]::Min($run.End, $other.End) - [Math]::Max($run.Start, $other.Start) + 1
+            if ($overlap -gt 0 -and (($overlap / [double]$run.Span) -ge 0.5)) {
+                $bothScans = $true
+                [void]$used2.Add($j)
             }
-            if ($tot -gt 0 -and (($slow / [double]$tot) -ge 0.5)) { $bothScans = $true }
         }
+        $cl = Get-ClusterMetrics -StartCyl $run.Start -EndCyl $run.End -Members $run.Members -R1 $R1 -R2 $R2 -Config $Config
+        $cl.Kind = 'Background'
+        $cl.Fill = [double]$run.Fill
+        $cl.Span = [int64]$run.Span
         if ($bothScans) {
             $cl.Risk = 'B'
             $cl.RiskReason = '区域整体持续偏慢（连续慢区或大窗口基线偏高），两次扫描均成立'
-            $cl.Isolated = $true
             $cl.GuardMiB = [double]$Config.GuardBackgroundMiB
         } else {
             $cl.Risk = 'C'
             $cl.RiskReason = '区域整体偏慢（连续慢区或大窗口基线偏高），仅单次扫描成立'
-            $cl.Isolated = $true
             $cl.GuardMiB = [double]$Config.GuardRepeatedMiB
         }
+        $cl.Isolated = $true
+        $out.Add($cl)
+    }
+
+    # 第二次扫描独有的区域：同样纳入，按单次扫描 C 级处理
+    for ($j = 0; $j -lt $runs2.Count; $j++) {
+        if ($used2.Contains($j)) { continue }
+        $run = $runs2[$j]
+        if ($run.Span -lt $minSpan) { continue }
+        if ($run.Fill -lt $minFill) { continue }
+        $cl = Get-ClusterMetrics -StartCyl $run.Start -EndCyl $run.End -Members $run.Members -R1 $R1 -R2 $R2 -Config $Config
+        $cl.Kind = 'Background'
+        $cl.Fill = [double]$run.Fill
+        $cl.Span = [int64]$run.Span
+        $cl.Risk = 'C'
+        $cl.RiskReason = '区域整体偏慢（仅第二次扫描成立）'
+        $cl.Isolated = $true
+        $cl.GuardMiB = [double]$Config.GuardRepeatedMiB
         $out.Add($cl)
     }
     return ,$out
@@ -1018,13 +1111,55 @@ function Convert-LbaToChs {
     return [pscustomobject]@{ Cylinder = $c; Head = $h; Sector = $s }
 }
 
+function Get-PhysicalDiskEvidence {
+    param($Report, [int64]$CapacitySectors, [int]$LogicalSectorBytes)
+
+    if ($null -eq $script:PhysicalDiskCache) {
+        try {
+            $script:PhysicalDiskCache = @(Get-CimInstance -ClassName Win32_DiskDrive -ErrorAction Stop)
+            $script:PhysicalDiskCacheError = $null
+        } catch {
+            $script:PhysicalDiskCache = @()
+            $script:PhysicalDiskCacheError = $_.Exception.Message
+        }
+    }
+    if ($null -ne $script:PhysicalDiskCacheError) {
+        return [pscustomobject]@{ Available = $false; Found = $false; Match = $false; Detail = ('WMI 不可用：{0}' -f $script:PhysicalDiskCacheError) }
+    }
+    if ($script:PhysicalDiskCache.Count -eq 0) {
+        return [pscustomobject]@{ Available = $true; Found = $false; Match = $false; Detail = '未找到 Win32_DiskDrive 记录' }
+    }
+    $modelKey = ''
+    if (-not [string]::IsNullOrWhiteSpace($Report.Model)) {
+        $modelKey = ($Report.Model -replace '^HD\d+\s*:\s*', '').Trim()
+        $p = $modelKey.IndexOf('(')
+        if ($p -gt 0) { $modelKey = $modelKey.Substring(0, $p).Trim() }
+    }
+    $expectedBytes = [int64]$CapacitySectors * [int64]$LogicalSectorBytes
+    foreach ($d in $script:PhysicalDiskCache) {
+        $model = [string]$d.Model
+        if ($modelKey.Length -gt 0 -and $model.IndexOf($modelKey, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            $size = [int64]$d.Size
+            $match = ($size -eq $expectedBytes)
+            return [pscustomobject]@{
+                Available = $true
+                Found = $true
+                Match = $match
+                Detail = ('型号 {0}，WMI 容量 {1} 字节，报告计算 {2} 字节' -f $model, $size, $expectedBytes)
+            }
+        }
+    }
+    return [pscustomobject]@{ Available = $true; Found = $false; Match = $false; Detail = ('未找到型号匹配“{0}”的物理磁盘' -f $modelKey) }
+}
+
 function Get-LbaMapping {
     param($R1, $Config)
 
     $evidence = New-Object 'System.Collections.Generic.List[object]'
-    $ok = $true
-    function Add-Ev([string]$Name, [bool]$Pass, [string]$Detail) {
-        $evidence.Add([pscustomobject]@{ Item = $Name; Pass = $Pass; Detail = $Detail })
+    $structuralOK = $true
+    function Add-Ev([string]$Name, [bool]$Pass, [string]$Detail, [string]$Status = '') {
+        if ([string]::IsNullOrEmpty($Status)) { $Status = $(if ($Pass) { '通过' } else { '未通过' }) }
+        $evidence.Add([pscustomobject]@{ Item = $Name; Pass = $Pass; Status = $Status; Detail = $Detail })
     }
 
     $spc = [int64]$R1.SectorsPerCylinder
@@ -1037,29 +1172,93 @@ function Get-LbaMapping {
     }
 
     Add-Ev '扫描从柱面 0 开始' $R1.StartsAtZero ("起始柱面 {0}" -f $R1.Cylinder[0])
-    if (-not $R1.StartsAtZero) { $ok = $false }
+    if (-not $R1.StartsAtZero) { $structuralOK = $false }
+
     Add-Ev '柱面编号连续' $R1.Contiguous ("缺失 {0} 个柱面" -f $R1.MissingCount)
-    if (-not $R1.Contiguous) { $ok = $false }
+    if (-not $R1.Contiguous) { $structuralOK = $false }
+
     Add-Ev '每柱面扇区数可确定' ($spc -gt 0) ("S={0}（出现 {1} 次）" -f $spc, $R1.SectorsPerCylinderFreq)
-    if ($spc -le 0) { $ok = $false }
-    Add-Ev '最后柱面为不完整柱面' (($R1.LastCylinderSectors -gt 0) -and ($R1.LastCylinderSectors -le $spc)) ("最后柱面 {0} 个扇区" -f $R1.LastCylinderSectors)
-    if ($R1.LastCylinderSectors -gt $spc) { $ok = $false }
+    if ($spc -le 0) { $structuralOK = $false }
+
+    # 非末柱面扇区数逐条一致
+    $badSectors = 0
+    $badSample = $null
+    if ($spc -gt 0) {
+        for ($i = 0; $i -lt ($R1.Count - 1); $i++) {
+            if ($R1.SectorCount[$i] -ne $spc) {
+                $badSectors++
+                if ($null -eq $badSample) { $badSample = $R1.Cylinder[$i] }
+            }
+        }
+    }
+    Add-Ev '非末柱面扇区数一致' ($badSectors -eq 0) ("不一致 {0} 条{1}" -f $badSectors, $(if ($null -ne $badSample) { "（例如柱面 $badSample）" } else { '' }))
+    if ($badSectors -gt 0) { $structuralOK = $false }
+
+    $lastFull = ($R1.LastCylinderSectors -eq $spc)
+    Add-Ev '最后柱面扇区数 ≤ 每柱面扇区数' (($R1.LastCylinderSectors -gt 0) -and ($R1.LastCylinderSectors -le $spc)) ("最后柱面 {0} 个扇区（{1}）" -f $R1.LastCylinderSectors, $(if ($lastFull) { '完整柱面' } else { '不完整柱面' }))
+    if ($R1.LastCylinderSectors -gt $spc) { $structuralOK = $false }
+
+    # 声明范围末端与实际末柱面一致
+    $actualLast = [int64]$R1.Cylinder[$R1.Count - 1]
+    $rangeEndOk = ($null -ne $R1.RangeEnd) -and ($actualLast -eq [int64]$R1.RangeEnd)
+    Add-Ev '声明范围末端与实际末柱面一致' $rangeEndOk ("声明 {0}，实际 {1}" -f $R1.RangeEnd, $actualLast)
+    if (-not $rangeEndOk) { $structuralOK = $false }
+
+    # 记录数与声明范围一致（防止报告尾部缺失仍被判为有效）
+    $countOk = ($null -ne $R1.RangeStart) -and ($null -ne $R1.RangeEnd) -and (($R1.RangeEnd - $R1.RangeStart + 1) -eq $R1.Count)
+    $expectedCount = if ($null -ne $R1.RangeStart -and $null -ne $R1.RangeEnd) { $R1.RangeEnd - $R1.RangeStart + 1 } else { '?' }
+    Add-Ev '记录数与声明范围一致' $countOk ("声明 {0} 条，实际 {1} 条" -f $expectedCount, $R1.Count)
+    if (-not $countOk) { $structuralOK = $false }
+
     $calc = [int64]($R1.Count - 1) * $spc + $R1.LastCylinderSectors
     Add-Ev '柱面布局与总扇区数自洽' ($calc -eq $cap) ("(N-1)*S+last={0}，实际合计 {1}" -f $calc, $cap)
-    if ($calc -ne $cap) { $ok = $false }
+    if ($calc -ne $cap) { $structuralOK = $false }
+
     Add-Ev '逻辑扇区大小有效' ([int]$Config.LogicalSectorBytes -ge 512) ("{0} bytes" -f $Config.LogicalSectorBytes)
-    if ([int]$Config.LogicalSectorBytes -lt 512) { $ok = $false }
-    if ($R1.DuplicateCount -gt 0) { $ok = $false }
+    if ([int]$Config.LogicalSectorBytes -lt 512) { $structuralOK = $false }
+
+    if ($R1.DuplicateCount -gt 0) { $structuralOK = $false }
+
+    # 独立证据：物理盘型号 + 容量（只读 WMI，不打开磁盘）
+    $indep = Get-PhysicalDiskEvidence -Report $R1 -CapacitySectors $cap -LogicalSectorBytes ([int]$Config.LogicalSectorBytes)
+    $indepPass = $indep.Found -and $indep.Match
+    $indepStatus = if ($indepPass) { '通过' } elseif (-not $indep.Found) { '未核对' } else { '未通过' }
+    Add-Ev '物理盘容量核对（独立证据）' $indepPass $indep.Detail $indepStatus
+
+    $ok = $structuralOK
+    if ($indep.Found -and -not $indep.Match) { $ok = $false }
+    if ([bool]$Config.RequireIndependentLbaEvidence -and -not $indepPass) { $ok = $false }
+
     if ([bool]$Config.RequireManualLbaConfirmation) {
         $manual = [bool]$Config.LbaMappingConfirmed
         Add-Ev '操作者已确认映射' $manual ("LbaMappingConfirmed={0}" -f $manual)
         if (-not $manual) { $ok = $false }
     } else {
-        Add-Ev '自动验证模式' $true 'RequireManualLbaConfirmation=false；以上结构证据全部通过即视为已验证'
+        Add-Ev '自动验证模式' $true 'RequireManualLbaConfirmation=false；结构证据 + 独立证据（若可用）'
+    }
+
+    $level = '结构验证失败'
+    if ($structuralOK) {
+        if ([bool]$Config.RequireManualLbaConfirmation -and -not [bool]$Config.LbaMappingConfirmed) {
+            $level = '等待人工确认'
+        } elseif ([bool]$Config.RequireIndependentLbaEvidence -and -not $indepPass) {
+            $level = '独立证据不足'
+        } elseif ($indepPass) {
+            $level = '结构验证通过 + 物理盘独立证据一致'
+        } elseif ($indep.Available) {
+            $level = '结构验证通过（未找到匹配物理盘，未做独立核对）'
+        } else {
+            $level = '结构验证通过（WMI 不可用，未做独立核对）'
+        }
     }
 
     return [pscustomobject]@{
         Verified = $ok
+        StructuralOK = $structuralOK
+        VerificationLevel = $level
+        IndependentAvailable = $indep.Available
+        IndependentFound = $indep.Found
+        IndependentMatch = $indep.Match
         SectorsPerCylinder = $spc
         CapacitySectors = $cap
         Evidence = $evidence.ToArray()
@@ -1079,8 +1278,14 @@ function Build-IsolationRanges {
         $ci++
         if (-not $cl.Isolated) { continue }
         $id++
-        $guardSectors = [int64][Math]::Ceiling(($cl.GuardMiB * $script:MiB) / [double]$logical)
-        $guardCyl = [int64][Math]::Ceiling($guardSectors / [double]$spc)
+        $guardSectors = 0
+        $guardCyl = 0
+        if ($spc -gt 0 -and $logical -gt 0) {
+            $guardSectors = [int64][Math]::Ceiling(($cl.GuardMiB * $script:MiB) / [double]$logical)
+            $guardCyl = [int64][Math]::Ceiling($guardSectors / [double]$spc)
+        }
+        $reason = [string]$cl.RiskReason
+        if ($spc -le 0 -or $logical -le 0) { $reason += '；SPC 或逻辑扇区大小未知，未计算 MiB 保护带' }
         $s = [Math]::Max([int64]0, $cl.StartCylinder - $guardCyl)
         $e = [Math]::Min([int64]$LastCylinder, $cl.EndCylinder + $guardCyl)
         $raw.Add([pscustomobject]@{
@@ -1092,7 +1297,7 @@ function Build-IsolationRanges {
             RawEnd = $cl.EndCylinder
             Risk = $cl.Risk
             GuardMiB = $cl.GuardMiB
-            Reason = $cl.RiskReason
+            Reason = $reason
             MergedFrom = @($cl.Risk)
             IsMerged = $false
             MaxMs1 = [double]$cl.MaxMs1
@@ -1100,6 +1305,7 @@ function Build-IsolationRanges {
             RegionP95 = [double]([Math]::Max($cl.RegionP951, $cl.RegionP952))
             Points = [int]$cl.PointCount
             ErrorPoints = [int]$cl.ErrorPoints
+            ErrorCylinders = @($cl.ErrorCylinders)
             Kind = [string]$cl.Kind
             Members = @($cl.Members)
         })
@@ -1118,10 +1324,11 @@ function Build-IsolationRanges {
             if ($rg.MaxMs1 -gt $last.MaxMs1) { $last.MaxMs1 = $rg.MaxMs1 }
             if ($rg.MaxMs2 -gt $last.MaxMs2) { $last.MaxMs2 = $rg.MaxMs2 }
             if ($rg.RegionP95 -gt $last.RegionP95) { $last.RegionP95 = $rg.RegionP95 }
-            $last.Points = [int]$last.Points + [int]$rg.Points
-            $last.ErrorPoints = [int]$last.ErrorPoints + [int]$rg.ErrorPoints
             if ($rg.Kind -eq 'Background') { $last.Kind = 'Background' }
             $last.Members = @(@($last.Members) + @($rg.Members) | Sort-Object -Unique)
+            $last.ErrorCylinders = @(@($last.ErrorCylinders) + @($rg.ErrorCylinders) | Sort-Object -Unique)
+            $last.Points = [int]$last.Members.Count
+            $last.ErrorPoints = [int]$last.ErrorCylinders.Count
             if ($rank[$rg.Risk] -gt $rank[$last.Risk]) { $last.Risk = $rg.Risk; $last.Reason = $rg.Reason }
             $last.IsMerged = $true
         } else {
@@ -1303,7 +1510,7 @@ function Invoke-DiskGuard {
         ), [System.Text.Encoding]::UTF8)
 
     if (-not $NoAccelerator) { Initialize-Accelerator }
-    else { Write-Warn '已禁用加速内核，将使用纯 PowerShell 局部统计（较慢）。' }
+    else { $script:Accelerated = $false; Write-Warn '已禁用加速内核，将使用纯 PowerShell 局部统计（较慢）。' }
 
     Write-Info ('DiskGuard v{0} 启动；模式：{1}' -f $script:Version, $(if ($Report2) { '双报告' } else { '单报告' }))
 
@@ -1317,6 +1524,10 @@ function Invoke-DiskGuard {
         Add-Log ('校验[' + $item.Level + '] ' + $item.Message)
         if ($item.Level -eq 'error') { Write-Warn ('结构校验：' + $item.Message) }
     }
+    if ($r1.Fatal) {
+        $fatalText = (@($r1.Validation | Where-Object { $_.Level -eq 'error' } | ForEach-Object { $_.Message }) -join '；')
+        throw ('第一次扫描报告存在致命结构错误，无法继续分析：' + $fatalText)
+    }
 
     $r2 = $null
     if ($Report2) {
@@ -1324,6 +1535,10 @@ function Invoke-DiskGuard {
         $r2 = Parse-Report -Path $Report2 -Label '扫描2' -Config $config
         Write-Info ('扫描2 解析完成：{0} 条记录（错误 {1} 条），耗时 {2:N2}s' -f $r2.Count, $r2.ErrorCount, $script:StageClock.Elapsed.TotalSeconds)
         $r2 = Test-ReportStructure -Report $r2 -Config $config
+        if ($r2.Fatal) {
+            Write-Warn '第二次扫描报告存在致命结构错误，已忽略第二份报告，改为单报告分析。'
+            $r2 = $null
+        }
     }
 
     # 双报告一致性
@@ -1333,7 +1548,10 @@ function Invoke-DiskGuard {
         if ($r1.Model -ne $r2.Model) { $comparisonValid = $false; $compareNotes.Add('两次报告的磁盘型号不一致。') }
         if ($r1.SectorsPerCylinder -ne $r2.SectorsPerCylinder) { $comparisonValid = $false; $compareNotes.Add('两次报告的每柱面扇区数不一致。') }
         if ($r1.RangeStart -ne $r2.RangeStart -or $r1.RangeEnd -ne $r2.RangeEnd) { $comparisonValid = $false; $compareNotes.Add('两次报告的扫描范围不一致。') }
-        if ($r1.Count -ne $r2.Count) { $compareNotes.Add('两次报告记录数不同，需人工核查。') }
+        if ($r1.Count -ne $r2.Count) {
+            $comparisonValid = $false
+            $compareNotes.Add('两次报告记录数不同，需人工核查；已禁止正式双报告 LBA 分区规划。')
+        }
         foreach ($n in $compareNotes) { Write-Warn ('双报告校验：' + $n) }
     }
 
@@ -1387,10 +1605,11 @@ function Invoke-DiskGuard {
     Write-Info '阶段 5/6：生成安全隔离区间与 LBA 映射……'
     $script:StageClock.Restart()
     $mapping = Get-LbaMapping -R1 $r1 -Config $config
+    if ($r1.MappingBlocked) { $mapping.Verified = $false }
     if (-not $comparisonValid) { $mapping.Verified = $false }
     $lastCyl = $r1.Cylinder[$r1.Count - 1]
     $iso = Build-IsolationRanges -Clusters $clusters -Mapping $mapping -Config $config -LastCylinder $lastCyl
-    Write-Info ('隔离区间 {0} 个；LBA 映射：{1}；耗时 {2:N2}s' -f $iso.Ranges.Count, $(if ($mapping.Verified) { '已验证' } else { '未验证' }), $script:StageClock.Elapsed.TotalSeconds)
+    Write-Info ('隔离区间 {0} 个；LBA 映射：{1}（{2}）；耗时 {3:N2}s' -f $iso.Ranges.Count, $(if ($mapping.Verified) { '已验证' } else { '未验证' }), $mapping.VerificationLevel, $script:StageClock.Elapsed.TotalSeconds)
 
     # 隔离区异常柱面明细（柱面号 + 两次扫描值）
     $isoDetails = New-Object 'System.Collections.Generic.List[object]'
@@ -1650,7 +1869,11 @@ function Invoke-DiskGuard {
     }
     $plan.Add('')
     $plan.Add('六、校验与说明')
-    $plan.Add(('  LBA 映射：{0}' -f $(if ($mapping.Verified) { '已验证（柱面 0 起、记录连续、SPC 一致、总扇区自洽）' } else { '未验证' })))
+    $plan.Add(('  LBA 映射：{0}（{1}）' -f $(if ($mapping.Verified) { '已验证' } else { '未验证' }), $mapping.VerificationLevel))
+    foreach ($ev in $mapping.Evidence) {
+        $plan.Add(('    [{0}] {1}：{2}' -f $ev.Status, $ev.Item, $ev.Detail))
+    }
+    if (-not $mapping.Verified) { $plan.Add('    未验证时只输出柱面范围，不输出 LBA 边界和分区方案。') }
     if ($r1.Validation.Count -gt 0) {
         foreach ($item in $r1.Validation) { $plan.Add(('  [{0}] {1}' -f $item.Level, $item.Message)) }
     } else { $plan.Add('  结构校验：未发现问题。') }
@@ -1747,7 +1970,10 @@ function Invoke-DiskGuard {
     }
 
     [void]$h.Append('<h2>说明</h2><ul class="muted">')
-    [void]$h.Append(('<li>LBA 映射：{0}</li>' -f $(if ($mapping.Verified) { '已验证' } else { '未验证' })))
+    [void]$h.Append(('<li>LBA 映射：{0}（{1}）</li>' -f $(if ($mapping.Verified) { '已验证' } else { '未验证' }), (& $enc $mapping.VerificationLevel)))
+    [void]$h.Append('<li>LBA 证据：<ul>')
+    foreach ($ev in $mapping.Evidence) { [void]$h.Append(('<li>[{0}] {1}：{2}</li>' -f $ev.Status, (& $enc $ev.Item), (& $enc $ev.Detail))) }
+    [void]$h.Append('</ul></li>')
     foreach ($item in $r1.Validation) { [void]$h.Append(('<li>[{0}] {1}</li>' -f $item.Level, (& $enc $item.Message))) }
     if ($null -ne $r2) { foreach ($n in $compareNotes) { [void]$h.Append(('<li>[双报告] {0}</li>' -f (& $enc $n))) } }
     [void]$h.Append('<li>统计异常不等于物理故障；隔离区间是保守建议，分区前请人工复核。</li>')

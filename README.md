@@ -13,9 +13,9 @@ DiskGuard 读取 DiskGenius 导出的 TXT 扫描报告，区分「明确读取�
 - **快**：60,802 条/份的双报告实测约 **7–8 秒**（旧版 v1.0.4 为 1017 秒）。
 - **可解释**：每条隔离区间都带柱面范围、风险等级、最大延迟、异常点数量、区域 P95。
 - **不过度隔离**：单个柱面即使两次都偏慢，只要未达临界幅度且不构成密集区域，只列入观察。
-- **LBA 安全**：只有 6 项结构证据全部通过才输出 LBA 和分区方案，否则只给柱面范围。
+- **LBA 安全**：10 项结构证据 + 物理盘独立证据；任一不通过只给柱面范围。
 - **可配置**：阈值、窗口、聚类、隔离带、风险策略、显示阈值都在 `Config.json`。
-- **自带测试**：24 项自动化测试，覆盖规范要求的 20 类场景 + 真实报告验收。
+- **自带测试**：34 项自动化测试，覆盖规范要求的 20 类场景 + 边界条件 + 真实报告验收。
 
 ## 快速开始
 
@@ -91,6 +91,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\DiskGuard.ps1 `
 | `ContextCylinders` | 10 | 区域背景统计的额外柱面数 |
 | `RegionSlowRatio` | 1.5 | 区域整体偏慢判据 |
 | `MinBackgroundSpan` | 20 | 连续慢区最小跨度 |
+| `MinBackgroundFill` | 0.5 | 背景慢区最小填充率（异常柱面 ÷ 跨度） |
 | `RiskProfile` | `strict` | 风险策略：`strict` / `standard` / `errors-only` |
 | `MinPartitionGiB` | 1.0 | 小于该容量的区间标为碎片 |
 | `MinPartitionPercent` | 20.0 | 分区方案只显示容量占比 ≥ 该值的分区 |
@@ -100,6 +101,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\DiskGuard.ps1 `
 | `GuardRepeatedMiB` | 256 | 高密度异常区每侧隔离带 |
 | `GuardBackgroundMiB` | 512 | 连续慢区每侧隔离带 |
 | `RequireManualLbaConfirmation` | `false` | 是否强制人工确认 LBA 映射 |
+| `RequireIndependentLbaEvidence` | `false` | 是否要求物理盘独立证据一致才输出 LBA |
 | `LbaMappingConfirmed` | `false` | 人工确认标记 |
 | `WriteCylinderComparison` | `false` | 是否输出 5 MB 逐柱面对照 CSV |
 
@@ -124,17 +126,35 @@ DiskGenius 报告按柱面记录，分区工具要的是绝对扇区号。换算
 LBA = 柱面 × 16065 + 磁头 × 63 + (扇区 - 1)
 ```
 
-只有以下 6 项结构证据全部通过才输出 LBA 和分区方案：
+只有以下结构证据全部通过才输出 LBA 和分区方案：
 
 1. 扫描从柱面 0 开始；
 2. 柱面编号连续；
 3. 每柱面扇区数可确定；
-4. 最后柱面为不完整柱面；
-5. `(N-1) × S + 最后柱面扇区数 = 报告总扇区数`；
-6. 逻辑扇区大小有效。
+4. 所有非末柱面的扇区数都等于该值（逐条检查，不只查总和）；
+5. 最后柱面扇区数 ≤ 每柱面扇区数（完整柱面也允许）；
+6. `(N-1) × S + 最后柱面扇区数 = 报告总扇区数`；
+7. 声明的扫描末端等于实际最后柱面；
+8. 记录数等于声明范围（防止报告尾部缺失仍被判为有效）；
+9. 逻辑扇区大小有效；
+10. 无重复柱面。
+
+在此之上还有一层**独立证据**：通过只读 WMI 查找型号匹配的物理盘，比对
+`Win32_DiskDrive.Size` 与报告计算出的容量。
+
+- 找到且一致：`结构验证通过 + 物理盘独立证据一致`；
+- 找不到：`结构验证通过（未找到匹配物理盘，未做独立核对）`；
+- 找到但不一致：直接拒绝 LBA。
+
+结论会明确写出验证等级，例如：
+
+```
+LBA 映射：已验证（结构验证通过（未找到匹配物理盘，未做独立核对））
+```
 
 任何一项不通过时只输出柱面范围，避免给出「看起来能用、实际会分错位置」的分区表。
-`RequireManualLbaConfirmation=true` 可在此基础上再加一道人工签字。
+`RequireManualLbaConfirmation=true` 可再加一道人工签字；
+`RequireIndependentLbaEvidence=true` 要求物理盘独立证据必须一致，否则不输出 LBA。
 
 ## 算法流水线
 
@@ -159,9 +179,29 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Tests\DiskGuard.Tests.
 - 分区方案的 CHS/LBA/总扇区数一致性；
 - 风险策略 `strict` / `errors-only` 的隔离数量差异；
 - 加速内核与纯 PowerShell 回退的一致性；
+- LBA 边界：最后柱面完整 / 不完整、非末柱面扇区数异常、声明末端不一致、尾部缺失、非零起始柱面；
+- 区域慢区：稀疏异常点不合并、仅第二次扫描出现的慢区；
+- 双报告记录数不一致时禁止正式 LBA；
+- SPC 未知时不除零；
 - 真实 ST3500418AS 双报告验收（记录数、3 条错误、8 个参考慢点、总扇区数、耗时、隔离区数量）。
 
-全部通过时退出码为 0。
+全部通过时退出码为 0。加速内核不可用时，测试 22 会打印 SKIP，不判失败。
+
+## 性能基准
+
+本机实测（Windows 10.0.19041，PowerShell 5.1.19041.6093，8 核）：
+
+| 场景 | 耗时 |
+|---|---:|
+| 双报告 60,802 × 2，加速内核 | 6.9–8.6 s |
+| 单报告 60,802 条 | 约 5–6 s |
+| 解析（每份） | 1.2–1.6 s |
+| 异常检测 | 约 2.5 s |
+| 聚类 | 约 0.7 s |
+| 隔离区间 + 输出 | 约 2 s |
+
+纯 PowerShell 回退在 60k 规模尚未完整计时（只在 400 条数据集上与加速路径做过一致性对比）；
+Windows PE 环境也未实测。`Tests\Benchmark.ps1` 可复现上述数字，`-IncludeFallback` 会额外跑回退路径。
 
 ## 目录结构
 
@@ -170,7 +210,8 @@ DiskGuard.ps1                     主程序（Windows PowerShell 5.1）
 DiskGuard_启动.cmd                双击启动入口
 Config.json                       可调整参数
 README.md                         本文件
-Tests\DiskGuard.Tests.ps1         自动化测试（24 项）
+Tests\DiskGuard.Tests.ps1         自动化测试（34 项）
+Tests\Benchmark.ps1               性能基准（可选）
 DiskGuard_算法设计与实现规范_v1.0.md   算法设计规范
 ```
 

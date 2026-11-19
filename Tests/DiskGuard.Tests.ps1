@@ -67,15 +67,17 @@ function New-SyntheticReport {
         [int]$RangeEnd = -1,
         [int[]]$SkipCylinders = @(),
         [int[]]$DuplicateCylinders = @(),
-        [string[]]$JunkLines = @()
+        [string[]]$JunkLines = @(),
+        [int]$StartCylinder = 0,
+        [hashtable]$SectorCountOverrides = @{}
     )
     $last = if ($LastSectors -gt 0) { $LastSectors } else { $Spc }
-    $rangeEnd = if ($RangeEnd -ge 0) { $RangeEnd } else { $Cylinders - 1 }
+    $rangeEnd = if ($RangeEnd -ge 0) { $RangeEnd } else { $StartCylinder + $Cylinders - 1 }
     $lines = New-Object 'System.Collections.Generic.List[string]'
     $lines.Add('DiskGenius 磁盘检测结果：')
     $lines.Add('')
     $lines.Add(('被检测磁盘：' + $Model))
-    $lines.Add(('检测范围：柱面 0 - {0} (该磁盘柱面总数：{0})' -f $rangeEnd))
+    $lines.Add(('检测范围：柱面 {0} - {1} (该磁盘柱面总数：{1})' -f $StartCylinder, $rangeEnd))
     $lines.Add('完成时间：2026-01-01 00:00:00')
     $lines.Add('')
     $lines.Add(('共检测到 {0} 个坏道区域。' -f $ErrorCylinders.Count))
@@ -83,8 +85,10 @@ function New-SyntheticReport {
     $lines.Add('         柱面号        磁头号          扇区号         扇区数目           耗时(ms)         修复情况   当前错误信息')
     $lines.Add('')
     foreach ($c in ($ErrorCylinders | Sort-Object)) {
+        $cyl = $StartCylinder + $c
         $sec = if ($c -eq ($Cylinders - 1)) { $last } else { $Spc }
-        $lines.Add(('{0,12}        未检测          未检测        {1,6}         {2,8}          未处理   Unknown Error.' -f $c, $sec, 3000))
+        if ($SectorCountOverrides.ContainsKey($cyl)) { $sec = [int]$SectorCountOverrides[$cyl] }
+        $lines.Add(('{0,12}        未检测          未检测        {1,6}         {2,8}          未处理   Unknown Error.' -f $cyl, $sec, 3000))
         $lines.Add('')
     }
     $lines.Add(('共检测到 {0} 个正常磁道。' -f ($Cylinders - $ErrorCylinders.Count)))
@@ -92,12 +96,15 @@ function New-SyntheticReport {
     $lines.Add('         柱面号        磁头号          扇区号         扇区数目           耗时(ms)         修复情况   当前错误信息')
     $lines.Add('')
     for ($i = 0; $i -lt $Cylinders; $i++) {
-        if ($SkipCylinders -contains $i) { continue }
-        if ($ErrorCylinders -contains $i) { continue }
-        $v = if ($MsMap.ContainsKey($i)) { [int]$MsMap[$i] } else { $DefaultMs }
-        if ($Spread -gt 0) { $v += [int](($i * 7919) % ($Spread + 1)) }
+        $cyl = $StartCylinder + $i
+        if ($SkipCylinders -contains $cyl) { continue }
+        if ($ErrorCylinders -contains $cyl) { continue }
+        $isMapped = $MsMap.ContainsKey($cyl)
+        $v = if ($isMapped) { [int]$MsMap[$cyl] } else { $DefaultMs }
+        if ($Spread -gt 0 -and -not $isMapped) { $v += [int](($cyl * 7919) % ($Spread + 1)) }
         $sec = if ($i -eq ($Cylinders - 1)) { $last } else { $Spc }
-        $lines.Add(('{0,12}        未检测          未检测        {1,6}         {2,8}          未处理   ' -f $i, $sec, $v))
+        if ($SectorCountOverrides.ContainsKey($cyl)) { $sec = [int]$SectorCountOverrides[$cyl] }
+        $lines.Add(('{0,12}        未检测          未检测        {1,6}         {2,8}          未处理   ' -f $cyl, $sec, $v))
         $lines.Add('')
     }
     foreach ($d in $DuplicateCylinders) {
@@ -128,10 +135,11 @@ function Get-RunOutput([string]$Dir) {
 }
 
 function Invoke-TestRun {
-    param([string]$R1, [string]$R2, [string]$Tag, [string]$ConfigPath)
+    param([string]$R1, [string]$R2, [string]$Tag, [string]$ConfigPath, [switch]$NoAccelerator)
     $outRoot = Join-Path $script:TempRoot $Tag
     New-Item -ItemType Directory -Path $outRoot -Force | Out-Null
     $splat = @{ Report1 = $R1; OutputRoot = $outRoot; NoBrowser = $true; NoPause = $true }
+    if ($NoAccelerator) { $splat.NoAccelerator = $true }
     if ($ConfigPath) { $splat.ConfigPath = $ConfigPath }
     if ($R2) { $splat.Report2 = $R2 } else { $splat.SingleScan = $true }
     $dir = Invoke-DiskGuard @splat 6>$null
@@ -461,7 +469,10 @@ Test-Case '21 分区方案参数（CHS / LBA / 总扇区）' {
 Test-Case '22 加速内核与回退实现一致' {
     Initialize-Accelerator
     $savedAccel = $script:Accelerated
-    Assert-True $savedAccel '加速内核不可用，无法执行一致性比较'
+    if (-not $savedAccel) {
+        Write-Host '      SKIP：当前环境无法编译 C# 加速内核，跳过一致性比较' -ForegroundColor Yellow
+        return
+    }
     $r = Join-Path $script:TempRoot 'r21.txt'
     New-SyntheticReport -Path $r -Cylinders 400 -DefaultMs 60 -Spread 12 -MsMap @{ 100 = 900; 200 = 200; 201 = 210; 300 = 500 }
     $cfg = Get-DiskGuardConfig (Join-Path $script:Root 'Config.json')
@@ -499,6 +510,134 @@ Test-Case '23 风险策略 strict 与 errors-only' {
     $eo = Invoke-TestRun -R1 $r -Tag 't23e' -ConfigPath $cfgPath2
     Assert-Equal 1 $eo.Ranges.Count 'errors-only 只隔离明确错误'
     Assert-Match $eo.Plan '风险策略：errors-only' '应说明当前风险策略'
+}
+
+
+# ---------------------------------------------------------------------------
+# 25 LBA：最后柱面完整
+# ---------------------------------------------------------------------------
+Test-Case '25 LBA：最后柱面完整也应验证通过' {
+    $r = Join-Path $script:TempRoot 'r25.txt'
+    New-SyntheticReport -Path $r -Cylinders 1200 -DefaultMs 60 -Spread 8
+    $run = Invoke-TestRun -R1 $r -Tag 't25'
+    Assert-Match $run.Plan 'LBA 映射：已验证' '完整最后柱面不应阻止映射'
+    Assert-Match $run.Plan '完整柱面' '证据应说明最后柱面为完整柱面'
+}
+
+# ---------------------------------------------------------------------------
+# 26 LBA：非末柱面扇区数异常
+# ---------------------------------------------------------------------------
+Test-Case '26 LBA：非末柱面扇区数异常必须拒绝' {
+    $r = Join-Path $script:TempRoot 'r26.txt'
+    New-SyntheticReport -Path $r -Cylinders 1200 -DefaultMs 60 -SectorCountOverrides @{ 600 = 16000 }
+    $run = Invoke-TestRun -R1 $r -Tag 't26'
+    Assert-Match $run.Plan 'LBA 映射：未验证' '非末柱面扇区数异常时不得输出 LBA'
+    Assert-Match $run.Plan '非末柱面扇区数一致' '应列出逐条扇区数证据'
+}
+
+# ---------------------------------------------------------------------------
+# 27 LBA：声明末端与实际末柱面不一致
+# ---------------------------------------------------------------------------
+Test-Case '27 LBA：声明末端与实际末柱面不一致必须拒绝' {
+    $r = Join-Path $script:TempRoot 'r27.txt'
+    New-SyntheticReport -Path $r -Cylinders 1200 -DefaultMs 60 -RangeEnd 1300
+    $run = Invoke-TestRun -R1 $r -Tag 't27'
+    Assert-Match $run.Plan 'LBA 映射：未验证' 'RangeEnd 不一致时不得输出 LBA'
+    Assert-Match $run.Plan '声明扫描末端' '校验应指出末端不一致'
+}
+
+# ---------------------------------------------------------------------------
+# 28 LBA：报告尾部缺失
+# ---------------------------------------------------------------------------
+Test-Case '28 LBA：报告尾部缺失必须拒绝' {
+    $r = Join-Path $script:TempRoot 'r28.txt'
+    $skip = @(1100..1199)
+    New-SyntheticReport -Path $r -Cylinders 1200 -DefaultMs 60 -SkipCylinders $skip
+    $run = Invoke-TestRun -R1 $r -Tag 't28'
+    Assert-Match $run.Plan 'LBA 映射：未验证' '尾部缺失时不得输出 LBA'
+    Assert-Match $run.Plan '实际解析 1100 条记录' '校验应指出记录数不足'
+}
+
+# ---------------------------------------------------------------------------
+# 29 区域慢区：稀疏异常点不得合并成连续慢区
+# ---------------------------------------------------------------------------
+Test-Case '29 区域慢区：稀疏异常点不得合并' {
+    $r = Join-Path $script:TempRoot 'r29.txt'
+    $map = @{ 100 = 120; 110 = 120; 120 = 120 }
+    for ($c = 600; $c -le 980; $c += 20) { $map[$c] = 150 }
+    New-SyntheticReport -Path $r -Cylinders 1200 -DefaultMs 60 -Spread 40 -MsMap $map
+    $run = Invoke-TestRun -R1 $r -Tag 't29'
+    $bg = @($run.Clusters | Where-Object { $_.Kind -eq 'Background' })
+    Assert-Equal 0 $bg.Count '稀疏点不应形成背景慢区'
+    Assert-Equal 0 $run.Ranges.Count '稀疏点不应产生隔离区间'
+}
+
+# ---------------------------------------------------------------------------
+# 30 区域慢区：仅第二次扫描出现的慢区
+# ---------------------------------------------------------------------------
+Test-Case '30 区域慢区：仅第二次扫描出现也要识别' {
+    $r1 = Join-Path $script:TempRoot 'r30a.txt'
+    $r2 = Join-Path $script:TempRoot 'r30b.txt'
+    $map2 = @{}
+    for ($c = 500; $c -le 900; $c++) { $map2[$c] = 300 }
+    New-SyntheticReport -Path $r1 -Cylinders 2000 -DefaultMs 60 -Spread 10
+    New-SyntheticReport -Path $r2 -Cylinders 2000 -DefaultMs 60 -Spread 10 -MsMap $map2
+    $run = Invoke-TestRun -R1 $r1 -R2 $r2 -Tag 't30'
+    Assert-True ($run.Ranges.Count -ge 1) 'R2 独有慢区应产生隔离区间'
+    $bg = @($run.Clusters | Where-Object { $_.Kind -eq 'Background' })
+    Assert-True ($bg.Count -ge 1) '应识别为区域慢区'
+}
+
+# ---------------------------------------------------------------------------
+# 31 非零起始柱面
+# ---------------------------------------------------------------------------
+Test-Case '31 非零起始柱面：拒绝 LBA 且不崩溃' {
+    $r = Join-Path $script:TempRoot 'r31.txt'
+    New-SyntheticReport -Path $r -Cylinders 600 -StartCylinder 1000 -DefaultMs 60 -MsMap @{ 1200 = 2000 }
+    $run = Invoke-TestRun -R1 $r -Tag 't31'
+    Assert-Match $run.Plan 'LBA 映射：未验证' '非零起始柱面不得输出 LBA'
+    Assert-Match $run.Plan '未从柱面 0 开始' '校验应指出起始柱面非 0'
+}
+
+# ---------------------------------------------------------------------------
+# 32 双报告记录数不一致
+# ---------------------------------------------------------------------------
+Test-Case '32 双报告记录数不一致：禁止正式 LBA' {
+    $r1 = Join-Path $script:TempRoot 'r32a.txt'
+    $r2 = Join-Path $script:TempRoot 'r32b.txt'
+    New-SyntheticReport -Path $r1 -Cylinders 1200 -DefaultMs 60
+    New-SyntheticReport -Path $r2 -Cylinders 1200 -DefaultMs 60 -SkipCylinders @(600)
+    $run = Invoke-TestRun -R1 $r1 -R2 $r2 -Tag 't32'
+    Assert-Match $run.Plan 'LBA 映射：未验证' '记录数不一致时不得输出 LBA'
+    Assert-Match $run.Plan '记录数不同' '应说明记录数不一致'
+}
+
+# ---------------------------------------------------------------------------
+# 33 纯 PowerShell 回退
+# ---------------------------------------------------------------------------
+Test-Case '33 纯 PowerShell 回退可运行' {
+    $r = Join-Path $script:TempRoot 'r33.txt'
+    New-SyntheticReport -Path $r -Cylinders 400 -DefaultMs 60 -Spread 12 -MsMap @{ 200 = 900 }
+    $run = Invoke-TestRun -R1 $r -Tag 't33' -NoAccelerator
+    Assert-Match $run.Plan '分区方案' '回退路径应生成分区方案'
+    Assert-True ($run.Ranges.Count -ge 1) '回退路径应识别异常'
+}
+
+# ---------------------------------------------------------------------------
+# 34 SPC 未知时不除零
+# ---------------------------------------------------------------------------
+Test-Case '34 SPC 未知时隔离区间不除零' {
+    $cfg = Get-DiskGuardConfig (Join-Path $script:Root 'Config.json')
+    $mapping = [pscustomobject]@{ Verified = $false; SectorsPerCylinder = 0; CapacitySectors = 0 }
+    $cluster = [pscustomobject]@{
+        Isolated = $true; GuardMiB = 512.0; StartCylinder = 100; EndCylinder = 120
+        Risk = 'C'; RiskReason = 'test'; MaxMs1 = 500.0; MaxMs2 = 500.0
+        RegionP951 = 400.0; RegionP952 = 400.0; PointCount = 21; ErrorPoints = 0
+        ErrorCylinders = @(); Kind = 'Anomaly'; Members = @(100..120)
+    }
+    $iso = Build-IsolationRanges -Clusters @($cluster) -Mapping $mapping -Config $cfg -LastCylinder 1199
+    Assert-Equal 1 $iso.Ranges.Count '应仍输出柱面范围'
+    Assert-Equal 100 ([int64]$iso.Ranges[0].StartCylinder) 'SPC 未知时保护带应为 0'
 }
 
 # ---------------------------------------------------------------------------

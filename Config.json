@@ -18,6 +18,7 @@
   "ContextCylinders": 10,
   "RegionSlowRatio": 1.5,
   "MinBackgroundSpan": 20,
+  "MinBackgroundFill": 0.5,
   "GuardBackgroundMiB": 512,
   "RiskProfile": "strict",
   "MinPartitionGiB": 1.0,
@@ -32,5 +33,6 @@
   "DiskCapacitySectorsOverride": null,
   "SectorsPerCylinderOverride": null,
   "LbaMappingConfirmed": false,
-  "RequireManualLbaConfirmation": false
+  "RequireManualLbaConfirmation": false,
+  "RequireIndependentLbaEvidence": false
 }
