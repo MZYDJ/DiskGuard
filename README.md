@@ -15,7 +15,7 @@ DiskGuard 读取 DiskGenius 导出的 TXT 扫描报告，区分「明确读取�
 - **不过度隔离**：单个柱面即使两次都偏慢，只要未达临界幅度且不构成密集区域，只列入观察。
 - **LBA 安全**：10 项结构证据 + 物理盘独立证据；任一不通过只给柱面范围。
 - **可配置**：阈值、窗口、聚类、隔离带、风险策略、显示阈值都在 `Config.json`。
-- **自带测试**：36 项自动化测试，覆盖规范要求的 20 类场景 + 边界条件 + 真实报告验收。
+- **自带测试**：38 项自动化测试，覆盖规范要求的 20 类场景 + 边界条件 + 真实报告验收。
 
 ## 快速开始
 
@@ -78,7 +78,7 @@ LBA 映射验证通过时，`Partition_Plan.txt` 的第七节会直接列出**�
 sudo bash Linux_Setup.sh /dev/sdX
 ```
 
-报告里的命令按分区逐条列出，方便只执行其中一部分。脚本会：
+报告里的命令按分区逐条列出，方便只执行其中一部分。脚本只使用 `Displayed=true` 的分区（同时满足 `MinPartitionGiB` 和 `MinPartitionPercent`）。脚本会：
 
 1. 校验目标盘是块设备、容量与报告总扇区数一致、没有挂载点、不是当前系统盘；
 2. 用 `sgdisk` 只在可用区间建 GPT 分区（类型 `8e00`），隔离带保持未分配；
@@ -128,8 +128,8 @@ LVM 只合并空间，不修复慢区/坏道；隔离带仍然空着。
 | `MinBackgroundSpan` | 20 | 连续慢区最小跨度 |
 | `MinBackgroundFill` | 0.5 | 背景慢区最小填充率（异常柱面 ÷ 跨度） |
 | `RiskProfile` | `strict` | 风险策略：`strict` / `standard` / `errors-only` |
-| `MinPartitionGiB` | 1.0 | 小于该容量的区间标为碎片 |
-| `MinPartitionPercent` | 20.0 | 分区方案只显示容量占比 ≥ 该值的分区 |
+| `MinPartitionGiB` | 2.0 | 小于该容量的区间不创建（碎片） |
+| `MinPartitionPercent` | 5.0 | 分区方案和 Linux 脚本只使用容量占比 ≥ 该值的分区 |
 | `HeadsPerCylinder` / `SectorsPerTrack` | 255 / 63 | CHS 几何 |
 | `GuardErrorMiB` | 1024 | 明确错误每侧隔离带 |
 | `GuardExtremeMiB` | 512 | 极端异常每侧隔离带 |
@@ -245,7 +245,7 @@ DiskGuard.ps1                     主程序（Windows PowerShell 5.1）
 DiskGuard_启动.cmd                双击启动入口
 Config.json                       可调整参数
 README.md                         本文件
-Tests\DiskGuard.Tests.ps1         自动化测试（36 项）
+Tests\DiskGuard.Tests.ps1         自动化测试（38 项）
 Tests\Benchmark.ps1               性能基准（可选）
 DiskGuard_算法设计与实现规范_v1.0.md   算法设计规范
 ```

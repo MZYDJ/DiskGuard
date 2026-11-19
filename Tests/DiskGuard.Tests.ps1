@@ -681,6 +681,40 @@ Test-Case '36 Linux：LBA 未验证时不生成脚本' {
     Assert-Match $run.Plan '未生成 Linux 命令' '计划中应说明未生成'
 }
 
+
+# ---------------------------------------------------------------------------
+# 37 分区阈值：小于 5% 的可用区间不显示
+# ---------------------------------------------------------------------------
+Test-Case '37 分区阈值：小于 5% 不显示' {
+    $r = Join-Path $script:TempRoot 'r37.txt'
+    New-SyntheticReport -Path $r -Cylinders 20000 -DefaultMs 60 -ErrorCylinders @(1000, 3000)
+    $run = Invoke-TestRun -R1 $r -Tag 't37'
+    Assert-Equal 3 $run.Parts.Count '应有 3 个可用区间'
+    $shown = @($run.Parts | Where-Object { $_.Displayed -eq 'true' })
+    Assert-Equal 2 $shown.Count '小于 5% 的区间不应显示'
+    $small = @($run.Parts | Where-Object { $_.Displayed -eq 'false' })
+    Assert-Equal 1 $small.Count '应有 1 个被隐藏的区间'
+    Assert-Equal 'true' $small[0].Recommended '被隐藏的区间仍应 ≥2 GiB'
+    $sh = Get-Content -LiteralPath (Join-Path $run.Dir 'Linux_Setup.sh') -Raw -Encoding UTF8
+    Assert-Equal 2 ([regex]::Matches($sh, 'sgdisk -n ').Count) '脚本应只创建显示的分区'
+}
+
+# ---------------------------------------------------------------------------
+# 38 分区阈值：小于 2 GiB 的可用区间不创建
+# ---------------------------------------------------------------------------
+Test-Case '38 分区阈值：小于 2 GiB 不创建' {
+    $r = Join-Path $script:TempRoot 'r38.txt'
+    New-SyntheticReport -Path $r -Cylinders 1200 -DefaultMs 60 -ErrorCylinders @(200, 1000)
+    $run = Invoke-TestRun -R1 $r -Tag 't38'
+    Assert-Equal 3 $run.Parts.Count '应有 3 个可用区间'
+    $shown = @($run.Parts | Where-Object { $_.Displayed -eq 'true' })
+    Assert-Equal 1 $shown.Count '只应显示 ≥2 GiB 的区间'
+    $frag = @($run.Parts | Where-Object { $_.Recommended -eq 'false' })
+    Assert-Equal 2 $frag.Count '两个小于 2 GiB 的区间应标为碎片'
+    $sh = Get-Content -LiteralPath (Join-Path $run.Dir 'Linux_Setup.sh') -Raw -Encoding UTF8
+    Assert-Equal 1 ([regex]::Matches($sh, 'sgdisk -n ').Count) '脚本应只创建显示的分区'
+}
+
 # ---------------------------------------------------------------------------
 # 24 真实 ST3500418AS 双报告验收
 # ---------------------------------------------------------------------------

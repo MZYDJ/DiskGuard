@@ -96,8 +96,8 @@ function Get-DiskGuardConfig([string]$Path) {
         MinBackgroundFill             = 0.5
         GuardBackgroundMiB            = 512
         RiskProfile                   = 'strict'
-        MinPartitionGiB               = 1.0
-        MinPartitionPercent           = 20.0
+        MinPartitionGiB               = 2.0
+        MinPartitionPercent           = 5.0
         HeadsPerCylinder              = 255
         SectorsPerTrack               = 63
         WriteCylinderComparison       = $false
@@ -1416,7 +1416,7 @@ function Write-LinuxSetupScript {
     param($Partitions, $Mapping, $Config, [string]$OutDir, [string]$Model)
 
     if (-not $Mapping.Verified) { return $null }
-    $parts = @($Partitions | Where-Object { $_.Recommended } | Sort-Object StartLba)
+    $parts = @($Partitions | Where-Object { $_.Displayed } | Sort-Object StartLba)
     if ($parts.Count -eq 0) { return $null }
 
     $modelKey = [string]$Model
@@ -1933,9 +1933,9 @@ function Invoke-DiskGuard {
             $plan.Add('')
             $plan.Add(('  共显示 {0} 个分区，合计 {1:N2} GiB，占硬盘 {2:N2}%。' -f $shown.Count, (($shown | Measure-Object -Property SizeGiB -Sum).Sum), (($shown | Measure-Object -Property Percent -Sum).Sum)))
         }
-        $plan.Add(('  显示阈值：分区容量 ≥ 硬盘总容量的 {0}%（Config.json: MinPartitionPercent）。' -f $config.MinPartitionPercent))
+        $plan.Add(('  显示阈值：分区容量 ≥ 硬盘总容量的 {0}%，且 ≥ {1} GiB（Config.json: MinPartitionPercent / MinPartitionGiB）。' -f $config.MinPartitionPercent, $config.MinPartitionGiB))
         if ($hidden.Count -gt 0) {
-            $plan.Add(('  另有 {0} 个可用区间小于 {1}% 未显示（明细见 Partition_Scheme.csv 的 Displayed 列）。' -f $hidden.Count, $config.MinPartitionPercent))
+            $plan.Add(('  另有 {0} 个可用区间未显示（小于 {1}% 或小于 {2} GiB；明细见 Partition_Scheme.csv 的 Displayed 列）。' -f $hidden.Count, $config.MinPartitionPercent, $config.MinPartitionGiB))
         }
         $plan.Add('  说明：柱面/磁头/扇区为 255/63 传统几何；起始扇区号为绝对 LBA。')
         $plan.Add('        各分区彼此独立，不能跨越隔离区间合并。')
@@ -1990,7 +1990,7 @@ function Invoke-DiskGuard {
     $plan.Add('七、Linux 分区与 LVM 命令（可逐条复制执行）')
     $linuxCmdLines = New-Object 'System.Collections.Generic.List[string]'
     if ($null -ne $linuxScript) {
-        $rec = @($partitions | Where-Object { $_.Recommended } | Sort-Object StartLba)
+        $rec = @($partitions | Where-Object { $_.Displayed } | Sort-Object StartLba)
         $modelKey = [string]$r1.Model
         if ($modelKey -match '^HD\d+\s*:\s*') { $modelKey = $modelKey -replace '^HD\d+\s*:\s*', '' }
         $paren = $modelKey.IndexOf('(')
@@ -2093,9 +2093,9 @@ function Invoke-DiskGuard {
             [void]$h.Append(('<p class="muted">共显示 {0} 个分区，合计 {1:N2} GiB，占硬盘 {2:N2}%。</p>' -f $shownHtml.Count, (($shownHtml | Measure-Object -Property SizeGiB -Sum).Sum), (($shownHtml | Measure-Object -Property Percent -Sum).Sum)))
         }
         if ($hiddenHtml.Count -gt 0) {
-            [void]$h.Append(('<p class="muted">另有 {0} 个可用区间小于 {1}% 未显示（明细见 Partition_Scheme.csv 的 Displayed 列）。</p>' -f $hiddenHtml.Count, $config.MinPartitionPercent))
+            [void]$h.Append(('<p class="muted">另有 {0} 个可用区间未显示（小于 {1}% 或小于 {2} GiB；明细见 Partition_Scheme.csv 的 Displayed 列）。</p>' -f $hiddenHtml.Count, $config.MinPartitionPercent, $config.MinPartitionGiB))
         }
-        [void]$h.Append(('<p class="muted">显示阈值：分区容量 ≥ 硬盘总容量的 {0}%。柱面/磁头/扇区为 255/63 传统几何；起始扇区号为绝对 LBA。</p>' -f $config.MinPartitionPercent))
+        [void]$h.Append(('<p class="muted">显示阈值：分区容量 ≥ 硬盘总容量的 {0}%，且 ≥ {1} GiB。柱面/磁头/扇区为 255/63 传统几何；起始扇区号为绝对 LBA。</p>' -f $config.MinPartitionPercent, $config.MinPartitionGiB))
     }
 
     [void]$h.Append('<h2>Linux 分区与 LVM</h2>')
