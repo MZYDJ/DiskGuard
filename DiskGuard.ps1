@@ -1489,13 +1489,8 @@ function Write-LinuxSetupScript {
     $L.Add(('wipefs -a {0}' -f ($pvs -join ' ')))
     $L.Add(('pvcreate {0}' -f ($pvs -join ' ')))
     $L.Add('')
-    $L.Add('SERIAL=$(lsblk -dno SERIAL "$DISK" 2>/dev/null | tr -d "[:space:]" || true)')
-    $L.Add('if [ -z "$SERIAL" ] || [ "$SERIAL" = "unknown" ]; then')
-    $L.Add('  SERIAL=$(lsblk -dno MODEL "$DISK" 2>/dev/null | tr -cd "[:alnum:]" | cut -c1-24 || true)')
-    $L.Add('fi')
-    $L.Add('if [ -z "$SERIAL" ]; then SERIAL=$(basename "$DISK"); fi')
     $L.Add('STAMP=$(date +%Y%m%d_%H%M)')
-    $L.Add('VG="vg_$(printf "%s" "$SERIAL" | tr "[:upper:]" "[:lower:]" | sed "s/[^a-z0-9+_.-]/_/g" | cut -c1-90)_${STAMP}"')
+    $L.Add(('VG="vg_{0}_${{STAMP}}"' -f $modelKey.ToLowerInvariant()))
     $L.Add('if vgs "$VG" >/dev/null 2>&1; then')
     $L.Add('  echo "VG $VG 已存在，请先 vgrename 或修改脚本中的 VG 名。" >&2')
     $L.Add('  exit 1')
@@ -2003,9 +1998,8 @@ function Invoke-DiskGuard {
         if ([string]::IsNullOrWhiteSpace($modelKey)) { $modelKey = 'DISK' }
 
         $linuxCmdLines.Add('设备：/dev/sdX（按实际替换；NVMe 为 /dev/nvme0n1，分区名加 p，如 /dev/nvme0n1p1）')
-        $linuxCmdLines.Add('VG 名（序列号 + 当前时间）：')
-        $linuxCmdLines.Add('  SERIAL=$(lsblk -dno SERIAL /dev/sdX | tr -d ''[:space:]'')')
-        $linuxCmdLines.Add(('  VG="vg_${{SERIAL:-{0}}}_$(date +%Y%m%d_%H%M)"' -f $modelKey))
+        $linuxCmdLines.Add('VG 名（型号 + 当前时间）：')
+        $linuxCmdLines.Add(('  VG="vg_{0}_$(date +%Y%m%d_%H%M)"' -f $modelKey.ToLowerInvariant()))
         $linuxCmdLines.Add('')
         $linuxCmdLines.Add('分区（隔离带留空，逐条执行）：')
         for ($i = 0; $i -lt $rec.Count; $i++) {
@@ -2104,7 +2098,7 @@ function Invoke-DiskGuard {
 
     [void]$h.Append('<h2>Linux 分区与 LVM</h2>')
     if ($null -ne $linuxScript) {
-        [void]$h.Append('<p class="muted">以下命令可逐条复制执行；也可直接运行 <a href="Linux_Setup.sh">Linux_Setup.sh</a>。VG 名为“序列号 + 当前时间”，序列号读不到时回退到型号。命令会清空目标盘分区表，执行前请确认设备名并备份。</p>')
+        [void]$h.Append('<p class="muted">以下命令可逐条复制执行；也可直接运行 <a href="Linux_Setup.sh">Linux_Setup.sh</a>。VG 名为“型号 + 当前时间”。命令会清空目标盘分区表，执行前请确认设备名并备份。</p>')
     } else {
         [void]$h.Append('<p class="muted">LBA 映射未验证，未生成 Linux 命令和 Linux_Setup.sh。</p>')
     }

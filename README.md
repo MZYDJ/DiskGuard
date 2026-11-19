@@ -51,7 +51,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\DiskGuard.ps1 `
 | `Anomaly_Clusters.csv` | 异常簇 / 连续慢区的区域指标与风险等级 |
 | `Anomaly_Details.csv` | 每个异常柱面的类别、延迟、局部阈值 |
 | `Scan_Comparison.csv` | 每次扫描的统计基线（中位数、MAD、P99、阈值等） |
-| `Linux_Setup.sh` | 映射验证通过时生成：Linux GPT 分区 + LVM 命令（VG 名从硬盘序列号生成） |
+| `Linux_Setup.sh` | 映射验证通过时生成：Linux GPT 分区 + LVM 命令（VG 名从型号 + 时间生成） |
 | `Analysis.log` | 阶段耗时、校验结果、未解析行、警告 |
 
 `Cylinder_Comparison.csv`（5 MB 逐柱面对照）默认不生成，需要时把
@@ -83,14 +83,13 @@ sudo bash Linux_Setup.sh /dev/sdX
 1. 校验目标盘是块设备、容量与报告总扇区数一致、没有挂载点、不是当前系统盘；
 2. 用 `sgdisk` 只在可用区间建 GPT 分区（类型 `8e00`），隔离带保持未分配；
 3. `wipefs` → `pvcreate` → `vgcreate` → `lvcreate` → `mkfs.ext4`；
-4. VG 名为 `vg_<序列号>_<yyyymmdd_hhmm>`：序列号从 `lsblk -dno SERIAL` 读取并清洗，
-   读不到时回退到型号；时间取执行时刻。
+4. VG 名为 `vg_<型号>_<yyyymmdd_hhmm>`：型号取自报告（如 `ST3500418AS` → `st3500418as`），
+   时间取执行时刻。
 
 示例：
 
 ```bash
-SERIAL=$(lsblk -dno SERIAL /dev/sdX | tr -d '[:space:]')
-VG="vg_${SERIAL:-ST3500418AS}_$(date +%Y%m%d_%H%M)"
+VG="vg_st3500418as_$(date +%Y%m%d_%H%M)"
 
 sgdisk -n 1:2781184:44161023 -t 1:8e00 /dev/sdX
 ...

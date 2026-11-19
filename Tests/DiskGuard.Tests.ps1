@@ -657,14 +657,16 @@ Test-Case '35 Linux：生成分区与 LVM 脚本' {
     Assert-Match $text 'vgcreate "\$VG"' '应包含 vgcreate'
     Assert-Match $text 'lvcreate -l 100%FREE' '应包含 lvcreate'
     Assert-Match $text 'mkfs\.ext4' '应包含 mkfs.ext4'
-    Assert-Match $text 'SERIAL=' '应包含序列号读取'
-    Assert-Match $text 'vg_' '应包含 vg_ 前缀'
+    Assert-Match $text 'STAMP=' '应包含时间戳'
+    Assert-NotMatch $text 'SERIAL=' '不应再读取序列号'
+    Assert-Match $text 'vg_synthetic' 'VG 名应使用型号'
     $bytes = [System.IO.File]::ReadAllBytes($sh)
     Assert-True (($bytes[0] -ne 0xEF) -or ($bytes[1] -ne 0xBB) -or ($bytes[2] -ne 0xBF)) '脚本不应带 BOM'
     Assert-Match $run.Plan 'Linux_Setup.sh' '计划中应提到脚本'
     Assert-Match $run.Plan 'sgdisk -n 1:' '计划中应包含分区命令'
     Assert-Match $run.Plan 'pvcreate /dev/sdX1' '计划中应包含 pvcreate'
     Assert-Match $run.Plan 'VG=' '计划中应包含 VG 命名命令'
+    Assert-Match $run.Plan 'vg_synthetic' '计划中的 VG 名应使用型号'
 }
 
 # ---------------------------------------------------------------------------
